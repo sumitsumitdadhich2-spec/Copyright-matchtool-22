@@ -1,0 +1,13 @@
+[2026-10-14T13:47:18.822Z] [INIT    ] ======================================================= 
+[2026-10-14T13:47:18.831Z] [INIT    ] Shiva MatchTool Chunk Scan Orchestrator Starting... 
+[2026-10-14T13:47:18.831Z] [INIT    ] Target URL: http://localhost:3000 
+[2026-10-14T13:47:18.832Z] [INIT    ] Total Chunks: 120 
+[2026-10-14T13:47:18.832Z] [INIT    ] Available Worker Slots: 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16 (Key 1 reserved, Slot 14 skipped) 
+[2026-10-14T13:47:18.832Z] [INIT    ] ======================================================= 
+[2026-10-14T13:47:18.832Z] [ORCH    ] Probing Primary Model (gemini-3.6-flash)... 
+[2026-10-14T13:47:18.833Z] [AUTH    ] Authenticating with http://localhost:3000 as admin... 
+[2026-10-14T13:47:20.085Z] [FATAL   ] Orchestrator encountered fatal error: Error: Authentication failed: HTTP 401 Unauthorized
+    at ensureAuth (file:///app/applet/scripts/chunk-scan-orchestrator.mjs:77:11)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async probeChoke (file:///app/applet/scripts/chunk-scan-orchestrator.mjs:92:18)
+    at async main (file:///app/applet/scripts/chunk-scan-orchestrator.mjs:284:26) 
