@@ -7,6 +7,9 @@ import { runFfmpeg } from '@/lib/ffmpeg-pool'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { Readable } from 'node:stream'
+import type { ReadableStream as WebReadableStream } from 'node:stream/web'
+import busboy from 'busboy'
 
 export const runtime = 'nodejs'
 
@@ -26,6 +29,88 @@ const ALLOWED_MODELS = [
 interface ChatHistoryItem {
   role: 'user' | 'model'
   content: string
+}
+
+interface ParsedMultipart {
+  prompt: string
+  model: string
+  keySelection: string
+  keySlot: number | null
+  customKey: string
+  fps: number
+  timelapse: number
+  history: ChatHistoryItem[]
+  tempInputPath: string | null
+}
+
+async function parseMultipart(req: NextRequest, contentType: string): Promise<ParsedMultipart> {
+  return new Promise((resolve, reject) => {
+    let prompt = ''
+    let model = 'gemini-3.8-flash'
+    let keySelection = 'auto'
+    let keySlot: number | null = null
+    let customKey = ''
+    let fps = 1
+    let timelapse = 1
+    let history: ChatHistoryItem[] = []
+    let tempInputPath: string | null = null
+    const fileWrites: Promise<void>[] = []
+
+    if (!req.body) {
+      return resolve({ prompt, model, keySelection, keySlot, customKey, fps, timelapse, history, tempInputPath })
+    }
+
+    const bb = busboy({ headers: { 'content-type': contentType } })
+
+    bb.on('field', (name, val) => {
+      if (name === 'prompt') prompt = val
+      else if (name === 'model') model = val
+      else if (name === 'keySelection') keySelection = val
+      else if (name === 'keySlot') keySlot = Number.parseInt(val, 10) || null
+      else if (name === 'customKey') customKey = val.trim()
+      else if (name === 'fps') fps = Math.max(0.1, Math.min(60, Number.parseFloat(val) || 1))
+      else if (name === 'timelapse') timelapse = Math.max(1, Math.min(120, Number.parseFloat(val) || 1))
+      else if (name === 'history') {
+        try {
+          history = JSON.parse(val)
+        } catch {
+          history = []
+        }
+      }
+    })
+
+    bb.on('file', (name, fileStream, info) => {
+      if (name === 'video') {
+        const ext = path.extname(info.filename || '') || '.mp4'
+        const randId = Math.random().toString(36).substring(2, 9)
+        const dest = path.join(os.tmpdir(), `cmt-chat-in-${Date.now()}-${randId}${ext}`)
+        tempInputPath = dest
+        const out = fs.createWriteStream(dest)
+        const p = new Promise<void>((resP, rejP) => {
+          fileStream.pipe(out)
+          out.on('finish', () => resP())
+          out.on('error', (err) => rejP(err))
+        })
+        fileWrites.push(p)
+      } else {
+        fileStream.resume()
+      }
+    })
+
+    bb.on('close', async () => {
+      try {
+        await Promise.all(fileWrites)
+        resolve({ prompt, model, keySelection, keySlot, customKey, fps, timelapse, history, tempInputPath })
+      } catch (err) {
+        reject(err)
+      }
+    })
+
+    bb.on('error', (err) => reject(err))
+
+    const nodeStream = Readable.fromWeb(req.body as unknown as WebReadableStream)
+    nodeStream.pipe(bb)
+  })
 }
 
 export async function POST(req: NextRequest) {
@@ -51,32 +136,18 @@ export async function POST(req: NextRequest) {
     let fps = 1
     let timelapse = 1
     let history: ChatHistoryItem[] = []
-    let videoFile: File | null = null
 
     if (contentType.includes('multipart/form-data')) {
-      const formData = await req.formData()
-      prompt = (formData.get('prompt') as string) || ''
-      model = (formData.get('model') as string) || 'gemini-3.8-flash'
-      keySelection = (formData.get('keySelection') as string) || 'auto'
-      const slotStr = formData.get('keySlot') as string
-      if (slotStr) keySlot = Number.parseInt(slotStr, 10) || null
-      customKey = ((formData.get('customKey') as string) || '').trim()
-      fps = Math.max(0.1, Math.min(60, Number.parseFloat((formData.get('fps') as string) || '1') || 1))
-      timelapse = Math.max(1, Math.min(120, Number.parseFloat((formData.get('timelapse') as string) || '1') || 1))
-
-      const historyRaw = formData.get('history') as string
-      if (historyRaw) {
-        try {
-          history = JSON.parse(historyRaw)
-        } catch {
-          history = []
-        }
-      }
-
-      const fileEntry = formData.get('video')
-      if (fileEntry instanceof File && fileEntry.size > 0) {
-        videoFile = fileEntry
-      }
+      const parsed = await parseMultipart(req, contentType)
+      prompt = parsed.prompt
+      model = parsed.model
+      keySelection = parsed.keySelection
+      keySlot = parsed.keySlot
+      customKey = parsed.customKey
+      fps = parsed.fps
+      timelapse = parsed.timelapse
+      history = parsed.history
+      tempInputPath = parsed.tempInputPath
     } else {
       const body = await req.json()
       prompt = body.prompt || ''
@@ -132,15 +203,9 @@ export async function POST(req: NextRequest) {
     // Handle video processing if video attached
     let geminiFileUri: string | null = null
 
-    if (videoFile) {
-      const ext = path.extname(videoFile.name) || '.mp4'
-      const randId = Math.random().toString(36).substring(2, 9)
-      tempInputPath = path.join(os.tmpdir(), `cmt-chat-in-${Date.now()}-${randId}${ext}`)
-
-      const buffer = Buffer.from(await videoFile.arrayBuffer())
-      await fs.promises.writeFile(tempInputPath, buffer)
-
+    if (tempInputPath && fs.existsSync(tempInputPath)) {
       let uploadFilePath = tempInputPath
+      const randId = Math.random().toString(36).substring(2, 9)
 
       // Only perform FFmpeg processing if timelapse speedup factor > 1 is explicitly requested.
       // Setting 24 fps (or any fps) does NOT re-encode the video — Gemini natively samples
@@ -266,7 +331,7 @@ export async function POST(req: NextRequest) {
       })
     }
 
-    const userPrompt = prompt.trim() || (videoFile ? 'Analyze this video clip and detail key actions, scene changes, and timestamps.' : 'Hello!')
+    const userPrompt = prompt.trim() || (tempInputPath ? 'Analyze this video clip and detail key actions, scene changes, and timestamps.' : 'Hello!')
     currentParts.push({ text: userPrompt })
 
     contents.push({
@@ -299,9 +364,9 @@ export async function POST(req: NextRequest) {
       sentAt: requestSentAt,
       respondedAt: requestRespondedAt,
       durationMs: requestRespondedAt - requestSentAt,
-      fps: videoFile ? fps : undefined,
-      timelapse: videoFile ? timelapse : undefined,
-      hadVideo: Boolean(videoFile),
+      fps: tempInputPath ? fps : undefined,
+      timelapse: tempInputPath ? timelapse : undefined,
+      hadVideo: Boolean(tempInputPath),
       timestamp: Date.now(),
     })
   } catch (err: unknown) {

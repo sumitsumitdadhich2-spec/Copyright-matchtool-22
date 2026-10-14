@@ -27,11 +27,10 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // Every /api route EXCEPT the video upload stream (/api/scans/<id>/upload).
+  // Every /api route EXCEPT the video upload stream (/api/scans/<id>/upload) and AI Chat video (/api/chat).
   // When the proxy runs on a request, Next.js clones the request body into RAM
   // (capped at experimental.proxyClientMaxBodySize, 10 MB by default) and
-  // silently truncates the rest — fatal for a multi-GB video body. The upload
-  // route therefore verifies the session cookie itself and streams the body
-  // straight to disk.
-  matcher: ['/api/((?!scans/[^/]+/upload(?:/|$)).*)'],
+  // silently truncates the rest — fatal for video payloads. Both routes verify
+  // the session cookie themselves.
+  matcher: ['/api/((?!scans/[^/]+/upload(?:/|$)|chat(?:/|$)).*)'],
 }
