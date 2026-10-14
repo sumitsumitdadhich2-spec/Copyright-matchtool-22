@@ -1,7 +1,7 @@
 import path from 'node:path'
 import fs from 'node:fs'
-import type { GoogleGenAI } from '@google/genai'
-import type { Scan, ChunkState, ChunkMatch, CandidateGroup, ShortSegmentState, ScanReport, ShortCoverage, ChunkTokenUsage } from './types'
+import type { Scan, ChunkState, ChunkMatch, CandidateGroup, ShortSegmentState, ScanReport, ShortCoverage, ChunkTokenUsage, LogEntry } from './types'
+import { globalOrchestrator } from './orchestrator-core'
 import {
   MODEL_POOL,
   CHUNK_MODEL_POOL,
@@ -103,6 +103,7 @@ const VERIFY_PER_LANE = VERIFY_MODEL_POOL.length * VERIFY_CONCURRENCY_PER_MODEL
 interface Job {
   scan: Scan
   lanes: KeyLane[]
+  resume: boolean
   /** PREFETCH OWNERSHIP: chunkIndex -> lane idx that pre-uploaded it. One lane
    *  per chunk, so the same chunk is never uploaded on 5 keys at once. Workers
    *  pull "their" pre-uploaded chunks first (lane affinity). */
@@ -386,18 +387,27 @@ class Scheduler {
       }
     }
 
+    const isScanResuming =
+      Boolean(resume) ||
+      Boolean(scan.background?.resume) ||
+      scan.status === 'stopped' ||
+      scan.status === 'error' ||
+      (scan.shortSegments?.some((s) => s.chunks.some((c) => c.status === 'done' || c.status === 'parked')) ?? false) ||
+      (scan.chunks?.some((c) => c.status === 'done' || c.status === 'parked') ?? false)
+
     const minuteNote = segments.length > 1 ? ` across ${segments.length} short minutes (scanned sequentially)` : ''
     addLog(
       scan,
       'info',
-      resume
-        ? `Resuming: ${pendingChunks} chunk(s) pending${minuteNote}`
+      isScanResuming
+        ? `Resuming scan: ${pendingChunks} chunk(s) pending${minuteNote} via OrchestratorCore (choke→burst pipeline)`
         : `Scan started: ${pendingChunks} chunk(s) queued${minuteNote} across ${CHUNK_MODEL_POOL.length} chunk models (${CHUNK_MODEL_POOL.map((m) => m.id).join(', ')}) × ${lanes.length} API key(s) — one prompt per chunk`,
     )
 
     const job: Job = {
       scan,
       lanes,
+      resume: isScanResuming,
       prefetchOwner: new Map(),
       tlKey: tlApiKey || null,
       seg: null,
@@ -442,6 +452,7 @@ class Scheduler {
   stop(scanId: string): { ok: boolean; error?: string } {
     globalChunkScanCoordinator.releaseChunkScanLock(scanId, true)
     globalChunkScanCoordinator.removeFromQueue(scanId)
+    globalOrchestrator.stop()
     const job = this.jobs.get(scanId)
     if (!job) return { ok: false, error: 'Scan is not running' }
     job.stopping = true
@@ -1321,15 +1332,21 @@ class Scheduler {
         // background so the next pass starts instantly.
         this.prepareNextSegment(job, segments, seg.index)
 
-        // CHUNK PIPELINE: STRICT 1-WORKER-PER-KEY-LANE.
-        // On ANY single API key, exactly ONE chunk request is processed at a time.
-        // No 2 models (e.g. 3.8 and 3.6) can ever execute in parallel on the same key lane!
-        // This eliminates TPM spikes (~3.65 Lakh tokens/min) and protects API keys from quota exhaustion.
-        job.laneFirstSuccess.clear()
-        const lanePromises = job.lanes.map(async (lane) => {
-          await this.laneWorker(job, lane)
-        })
-        await Promise.all(lanePromises)
+        if (job.resume) {
+          // RESUME PATH: STRICTLY use OrchestratorCore (lib/orchestrator-core.ts).
+          // Legacy scheduler chunk dispatch (this.laneWorker) is NEVER called!
+          await this.runOrchestratorChunkScan(job, seg)
+        } else {
+          // CHUNK PIPELINE: STRICT 1-WORKER-PER-KEY-LANE.
+          // On ANY single API key, exactly ONE chunk request is processed at a time.
+          // No 2 models (e.g. 3.8 and 3.6) can ever execute in parallel on the same key lane!
+          // This eliminates TPM spikes (~3.65 Lakh tokens/min) and protects API keys from quota exhaustion.
+          job.laneFirstSuccess.clear()
+          const lanePromises = job.lanes.map(async (lane) => {
+            await this.laneWorker(job, lane)
+          })
+          await Promise.all(lanePromises)
+        }
         // Catch any candidates merged by the very last chunk.
         this.enqueueNewGroups(job)
 
@@ -1458,6 +1475,150 @@ class Scheduler {
     if (releaseChunkLock) releaseChunkLock()
   }
 }
+
+  /**
+   * MATCHTOOL ORCHESTRATOR CHUNK SCANNER (choke -> burst -> failover -> recovery)
+   * Exclusively handles resumed scans using OrchestratorCore (lib/orchestrator-core.ts).
+   * Legacy laneWorker chunk loop is completely bypassed on the resume flow.
+   */
+  private async runOrchestratorChunkScan(job: Job, seg: ShortSegmentState) {
+    const { scan } = job
+    // Stop any existing orchestrator first to ensure ONLY one orchestrator is active
+    globalOrchestrator.stop()
+
+    // 1. Register active worker keys into orchestrator (slots 2..13, 15, 16)
+    for (const lane of job.lanes) {
+      globalOrchestrator.registerKey(lane.idx, lane.apiKey)
+    }
+
+    // 2. Load pending & failed chunks for THIS minute segment
+    // Revive any stray scanning or failed status chunks to pending
+    for (const c of seg.chunks) {
+      if (c.status === 'scanning' || c.status === 'failed') {
+        c.status = 'pending'
+      }
+    }
+
+    const pendingOrFailed = seg.chunks
+      .filter((c) => c.status === 'pending')
+      .map((c) => ({
+        index: c.index,
+        attempts: c.requestCount || c.attempts || 0,
+        lastError: c.lastError,
+      }))
+
+    if (pendingOrFailed.length === 0) {
+      addLog(scan, 'info', `[choke_primary] Minute ${seg.index + 1}: no pending or failed chunks left to scan.`)
+      return
+    }
+
+    addLog(
+      scan,
+      'info',
+      `[choke_primary] Initializing OrchestratorCore for Minute ${seg.index + 1} (${pendingOrFailed.length} chunk(s) pending/failed across ${job.lanes.length} worker keys) — starting choke→burst cycle`,
+    )
+
+    // Load chunks into OrchestratorCore
+    globalOrchestrator.prepareChunks(scan.id, pendingOrFailed)
+
+    // Stream logs to scan.logs and sync scan.orchestrator
+    const unsubscribeLog = globalOrchestrator.onLog((event) => {
+      const state = globalOrchestrator.getState()
+      scan.orchestrator = state
+      const level: LogEntry['level'] =
+        event.type === 'error'
+          ? 'error'
+          : event.type === 'warn'
+            ? 'warn'
+            : event.outcome === 'success'
+              ? 'success'
+              : 'info'
+      // Log formatted message so the phase ("choke_primary" / "choke_secondary" / "burst_primary") is clearly visible in scan logs
+      addLog(scan, level, `[${state.phase}] ${event.message}`)
+      job.dirty = true
+    })
+
+    // Setup chunk executor
+    globalOrchestrator.setChunkExecutor(
+      async (chunkIndex, keySlot, apiKey, model, timeoutMs, signal) => {
+        if (job.stopping) {
+          return { ok: false, isTimeout: true, error: 'Scan stopped by user' }
+        }
+
+        const lane = job.lanes.find((l) => l.idx === keySlot) || {
+          idx: keySlot,
+          apiKey,
+          ai: getClient(apiKey),
+          segUris: new Map(),
+          segUriPromises: new Map(),
+          chunkUploads: new Map(),
+          verifyActive: 0,
+          verifyActiveByModel: new Map(),
+        }
+
+        const modelSpec =
+          MODEL_POOL.find((m) => m.id === model) ||
+          CHUNK_MODEL_POOL.find((m) => m.id === model) || {
+            id: model,
+            label: model,
+            rpm: 5,
+            rpd: 20,
+            tpm: 1_000_000,
+            contextWindow: 1_000_000,
+            color: 'emerald',
+            role: 'primary',
+          }
+
+        try {
+          const c = scan.chunks[chunkIndex]
+          if (c && c.status !== 'match' && c.status !== 'no_match') {
+            c.status = 'pending'
+          }
+          await this.processChunk(job, lane, modelSpec, chunkIndex)
+          // Catch any candidates merged by this chunk
+          this.enqueueNewGroups(job)
+          return { ok: true }
+        } catch (err: unknown) {
+          const c = scan.chunks[chunkIndex]
+          if (c && c.status !== 'match' && c.status !== 'no_match') {
+            c.status = 'pending'
+          }
+          const msg = err instanceof Error ? err.message : String(err)
+          const lower = msg.toLowerCase()
+          const is503 =
+            lower.includes('503') ||
+            lower.includes('high demand') ||
+            lower.includes('overloaded') ||
+            lower.includes('unavailable')
+          const is429 =
+            lower.includes('429') ||
+            lower.includes('quota') ||
+            lower.includes('resource_exhausted')
+          const isTimeout =
+            signal.aborted ||
+            lower.includes('timeout') ||
+            lower.includes('timed out')
+
+          return {
+            ok: false,
+            is503,
+            is429,
+            isTimeout,
+            error: msg,
+          }
+        }
+      },
+    )
+
+    try {
+      await globalOrchestrator.runOrchestrationLoop()
+    } finally {
+      unsubscribeLog()
+      scan.orchestrator = globalOrchestrator.getState()
+      job.dirty = true
+      this.mark(job)
+    }
+  }
 
   // ---------- Candidate + Verifier pipeline ----------
 

@@ -202,6 +202,15 @@ export class ChunkScanOrchestrator {
     return JSON.parse(JSON.stringify(this.state))
   }
 
+  private onLogListeners: ((event: OrchestratorLogEvent) => void)[] = []
+
+  public onLog(listener: (event: OrchestratorLogEvent) => void): () => void {
+    this.onLogListeners.push(listener)
+    return () => {
+      this.onLogListeners = this.onLogListeners.filter((l) => l !== listener)
+    }
+  }
+
   public getLogs(): OrchestratorLogEvent[] {
     return this.logs.slice(-200)
   }
@@ -213,6 +222,14 @@ export class ChunkScanOrchestrator {
     }
     this.state.lastMessage = `[${event.type.toUpperCase()}] ${event.message}`
     this.state.lastUpdated = Date.now()
+
+    for (const listener of this.onLogListeners) {
+      try {
+        listener(event)
+      } catch {
+        /* ignore callback error */
+      }
+    }
   }
 
   private refreshQueueCounts() {
@@ -237,25 +254,35 @@ export class ChunkScanOrchestrator {
   }
 
   /**
-   * Load chunks into queue and prepare orchestrator
+   * Load chunks into queue and prepare orchestrator.
+   * Supports chunk index numbers or item objects with prior attempts and error details.
    */
-  public prepareChunks(scanId: string, chunkIndexes: number[]) {
+  public prepareChunks(
+    scanId: string,
+    chunks: number[] | { index: number; attempts?: number; lastError?: string }[],
+  ) {
     this.activeScanId = scanId
     this.stopping = false
     this.pauseRequested = false
     this.initSlots()
 
-    this.chunkQueue = chunkIndexes.map((idx) => ({
-      index: idx,
-      status: 'pending',
-      attempts: 0,
-    }))
+    this.chunkQueue = chunks.map((item) => {
+      const idx = typeof item === 'number' ? item : item.index
+      const attempts = typeof item === 'number' ? 0 : item.attempts || 0
+      const lastError = typeof item === 'number' ? undefined : item.lastError
+      return {
+        index: idx,
+        status: 'pending' as const,
+        attempts,
+        lastError,
+      }
+    })
 
     this.refreshQueueCounts()
     this.log({
       timestamp: Date.now(),
       type: 'info',
-      message: `Loaded ${chunkIndexes.length} chunks for scan ${scanId} across ${this.keyApiMap.size} available worker keys.`,
+      message: `Loaded ${chunks.length} chunks for scan ${scanId} across ${this.keyApiMap.size} available worker keys.`,
     })
   }
 
@@ -461,10 +488,22 @@ export class ChunkScanOrchestrator {
       // 1. PRIMARY: Probe 3.6
       this.state.phase = 'choke_primary'
       this.state.activeModel = ORCHESTRATOR_PRIMARY_MODEL
+      this.log({
+        timestamp: Date.now(),
+        type: 'choke',
+        model: ORCHESTRATOR_PRIMARY_MODEL,
+        message: `Phase [choke_primary]: Probing primary model ${ORCHESTRATOR_PRIMARY_MODEL}...`,
+      })
       const primaryChoke = await this.probeChoke(ORCHESTRATOR_PRIMARY_MODEL)
 
       if (primaryChoke.ok) {
         this.state.phase = 'burst_primary'
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_PRIMARY_MODEL,
+          message: `Phase [burst_primary]: Launching burst pipeline on ${ORCHESTRATOR_PRIMARY_MODEL} (max 10 parallel, 3s stagger)...`,
+        })
         await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL)
         continue
       }
@@ -479,10 +518,22 @@ export class ChunkScanOrchestrator {
 
       this.state.phase = 'choke_secondary'
       this.state.activeModel = ORCHESTRATOR_SECONDARY_MODEL
+      this.log({
+        timestamp: Date.now(),
+        type: 'choke',
+        model: ORCHESTRATOR_SECONDARY_MODEL,
+        message: `Phase [choke_secondary]: Probing secondary model ${ORCHESTRATOR_SECONDARY_MODEL}...`,
+      })
       const secChoke = await this.probeChoke(ORCHESTRATOR_SECONDARY_MODEL)
 
       if (secChoke.ok) {
         this.state.phase = 'burst_secondary'
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_SECONDARY_MODEL,
+          message: `Phase [burst_secondary]: Launching burst pipeline on ${ORCHESTRATOR_SECONDARY_MODEL}...`,
+        })
         // Simultaneously probe 3.8: if ready, also burst 3.8
         const tertiaryChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
         if (tertiaryChoke.ok) {
@@ -506,10 +557,22 @@ export class ChunkScanOrchestrator {
 
       this.state.phase = 'choke_tertiary'
       this.state.activeModel = ORCHESTRATOR_TERTIARY_MODEL
+      this.log({
+        timestamp: Date.now(),
+        type: 'choke',
+        model: ORCHESTRATOR_TERTIARY_MODEL,
+        message: `Phase [choke_tertiary]: Probing tertiary model ${ORCHESTRATOR_TERTIARY_MODEL}...`,
+      })
       const tertChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
 
       if (tertChoke.ok) {
         this.state.phase = 'burst_tertiary'
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_TERTIARY_MODEL,
+          message: `Phase [burst_tertiary]: Launching burst pipeline on ${ORCHESTRATOR_TERTIARY_MODEL}...`,
+        })
         await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL)
         continue
       }
@@ -567,18 +630,30 @@ export class ChunkScanOrchestrator {
 
     const inFlightPromises: Promise<void>[] = []
 
-    for (const slot of slotsToUse) {
+    for (let i = 0; i < slotsToUse.length; i++) {
       if (this.stopping) break
+      const slot = slotsToUse[i]
 
-      // Take next chunk from queue (retries first, then new)
-      const nextChunk = this.getNextChunkForAssignment(slot, model)
-      if (!nextChunk) break
+      // Stagger launches by 3 seconds between slot workers
+      if (i > 0) {
+        await new Promise((r) => setTimeout(r, ORCHESTRATOR_BURST_STAGGER_MS))
+      }
 
-      // 3-second stagger between starts to prevent simultaneous-burst 429 wall
-      await new Promise((r) => setTimeout(r, ORCHESTRATOR_BURST_STAGGER_MS))
+      const slotTask = (async () => {
+        while (!this.stopping && !this.pauseRequested) {
+          const nextChunk = this.getNextChunkForAssignment(slot, model)
+          if (!nextChunk) break
 
-      const task = this.processChunkOnSlot(nextChunk, slot, model)
-      inFlightPromises.push(task)
+          const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
+          if (outcome !== 'success') {
+            // Model error (503 / 429 / timeout) encountered on this slot:
+            // Break slot loop so the outer orchestrator can evaluate health and failover
+            break
+          }
+        }
+      })()
+
+      inFlightPromises.push(slotTask)
     }
 
     if (inFlightPromises.length > 0) {
@@ -589,10 +664,14 @@ export class ChunkScanOrchestrator {
   /**
    * Continuous pipeline chunk processor with strict 1-chunk-per-key locking.
    */
-  private async processChunkOnSlot(chunk: ChunkQueueItem, slot: number, model: string): Promise<void> {
+  private async processChunkOnSlot(
+    chunk: ChunkQueueItem,
+    slot: number,
+    model: string,
+  ): Promise<'success' | '503' | '429' | 'timeout'> {
     const slotState = this.state.slots[slot]
     const apiKey = this.keyApiMap.get(slot)
-    if (!slotState || !apiKey) return
+    if (!slotState || !apiKey) return '503'
 
     chunk.status = 'processing'
     chunk.assignedKey = slot
@@ -709,15 +788,9 @@ export class ChunkScanOrchestrator {
       slotState.lastLatencyMs = Date.now() - startTime
       this.refreshQueueCounts()
       this.state.lastUpdated = Date.now()
-
-      // Continuous pipeline: If more pending chunks exist and this model is still healthy, immediately assign next chunk!
-      if (!this.stopping && outcome === 'success' && this.state.queue.pending > 0) {
-        const next = this.getNextChunkForAssignment(slot, model)
-        if (next) {
-          void this.processChunkOnSlot(next, slot, model)
-        }
-      }
     }
+
+    return outcome
   }
 
   private getNextChunkForAssignment(slot: number, model: string): ChunkQueueItem | null {
@@ -828,3 +901,4 @@ export class ChunkScanOrchestrator {
 
 // Global orchestrator singleton instance for the app
 export const globalOrchestrator = new ChunkScanOrchestrator()
+export { ChunkScanOrchestrator as OrchestratorCore }

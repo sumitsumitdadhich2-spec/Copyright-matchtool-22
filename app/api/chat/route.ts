@@ -108,8 +108,13 @@ async function parseMultipart(req: NextRequest, contentType: string): Promise<Pa
 
     bb.on('error', (err) => reject(err))
 
-    const nodeStream = Readable.fromWeb(req.body as unknown as WebReadableStream)
-    nodeStream.pipe(bb)
+    try {
+      const nodeStream = Readable.fromWeb(req.body as unknown as WebReadableStream)
+      nodeStream.on('error', (err) => reject(err))
+      nodeStream.pipe(bb)
+    } catch (streamErr) {
+      reject(streamErr)
+    }
   })
 }
 
@@ -138,16 +143,45 @@ export async function POST(req: NextRequest) {
     let history: ChatHistoryItem[] = []
 
     if (contentType.includes('multipart/form-data')) {
-      const parsed = await parseMultipart(req, contentType)
-      prompt = parsed.prompt
-      model = parsed.model
-      keySelection = parsed.keySelection
-      keySlot = parsed.keySlot
-      customKey = parsed.customKey
-      fps = parsed.fps
-      timelapse = parsed.timelapse
-      history = parsed.history
-      tempInputPath = parsed.tempInputPath
+      try {
+        const parsed = await parseMultipart(req, contentType)
+        prompt = parsed.prompt
+        model = parsed.model
+        keySelection = parsed.keySelection
+        keySlot = parsed.keySlot
+        customKey = parsed.customKey
+        fps = parsed.fps
+        timelapse = parsed.timelapse
+        history = parsed.history
+        tempInputPath = parsed.tempInputPath
+      } catch (bbErr) {
+        console.warn('[AI Chat] busboy multipart parsing failed, trying FormData fallback:', bbErr)
+        try {
+          const fd = await req.formData()
+          prompt = (fd.get('prompt') as string) || ''
+          model = (fd.get('model') as string) || 'gemini-3.8-flash'
+          keySelection = (fd.get('keySelection') as string) || 'auto'
+          const slotVal = fd.get('keySlot') as string | null
+          keySlot = slotVal ? Number.parseInt(slotVal, 10) : null
+          customKey = ((fd.get('customKey') as string) || '').trim()
+          fps = Math.max(0.1, Math.min(60, Number(fd.get('fps')) || 1))
+          timelapse = Math.max(1, Math.min(120, Number(fd.get('timelapse')) || 1))
+          const histVal = fd.get('history') as string | null
+          history = histVal ? JSON.parse(histVal) : []
+          const videoFile = fd.get('video') as File | null
+          if (videoFile && typeof videoFile.arrayBuffer === 'function') {
+            const buf = Buffer.from(await videoFile.arrayBuffer())
+            const randId = Math.random().toString(36).substring(2, 9)
+            const dest = path.join(os.tmpdir(), `cmt-chat-in-${Date.now()}-${randId}.mp4`)
+            await fs.promises.writeFile(dest, buf)
+            tempInputPath = dest
+          }
+        } catch {
+          throw new Error(
+            `Unable to parse uploaded video stream: ${bbErr instanceof Error ? bbErr.message : String(bbErr)}`,
+          )
+        }
+      }
     } else {
       const body = await req.json()
       prompt = body.prompt || ''
