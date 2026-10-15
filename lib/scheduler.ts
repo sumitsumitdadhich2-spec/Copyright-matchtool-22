@@ -279,16 +279,23 @@ class Scheduler {
       if (!tlApiKey && Array.isArray(seg.prefilterChunks)) delete seg.prefilterChunks
       for (const c of seg.chunks) {
         const inRange = chunkOverlapsSegRange(scan, seg, c.index)
-        if (c.status === 'scanning') c.status = 'pending'
-        // 'cancelled' is ONLY ever set by skip logic (range, pre-filter, or
-        // EARLY-STOP), so revive cancelled chunks that fall inside the CURRENT
-        // range — on fresh starts too, not just Resume. Otherwise changing a
-        // minute's movie range after a run leaves the newly chosen part
-        // permanently skipped. EXCEPTION: early-stop-skipped chunks of a DONE
-        // minute stay skipped — us minute ke saare matches confirm ho chuke hain.
-        if (c.status === 'cancelled' && inRange && !(c.skippedEarlyStop && seg.status === 'done')) {
-          c.status = 'pending'
-          delete c.skippedEarlyStop
+        const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
+
+        // Any chunk without genuine result (match / no_match) that is in range must be revived to pending
+        if (!isGenuinelyFinished) {
+          if (c.status === 'scanning' || c.status === 'failed' || (c.status as string) === 'done' || (c.status as string) === 'error') {
+            c.status = 'pending'
+          }
+          // 'cancelled' is ONLY ever set by skip logic (range, pre-filter, or
+          // EARLY-STOP), so revive cancelled chunks that fall inside the CURRENT
+          // range — on fresh starts too, not just Resume. Otherwise changing a
+          // minute's movie range after a run leaves the newly chosen part
+          // permanently skipped. EXCEPTION: early-stop-skipped chunks of a DONE
+          // minute stay skipped — us minute ke saare matches confirm ho chuke hain.
+          if (c.status === 'cancelled' && inRange && !(c.skippedEarlyStop && seg.status === 'done')) {
+            c.status = 'pending'
+            delete c.skippedEarlyStop
+          }
         }
         if (c.status === 'pending' && !inRange) c.status = 'cancelled'
         // Re-apply the persisted pre-filter selection (resume path). A fresh
@@ -298,7 +305,12 @@ class Scheduler {
         }
       }
       if (seg.status === 'scanning' || seg.status === 'verifying') seg.status = 'pending'
-      if (seg.status === 'done' && seg.chunks.some((c) => c.status === 'pending')) seg.status = 'pending'
+      // If ANY chunk in this segment is still pending or not genuinely finished (not match/no_match/cancelled),
+      // the segment CANNOT be marked done!
+      const hasUnfinishedChunks = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
+      if (hasUnfinishedChunks) {
+        seg.status = 'pending'
+      }
     }
     // MINUTE SELECTION: only segments with selected !== false take part in the
     // scan (default = all selected). Unselected minutes are skipped entirely.
@@ -1295,6 +1307,16 @@ class Scheduler {
         if (job.stopping) break
         // MINUTE SELECTION: unselected minutes are skipped entirely (quota saver).
         if (seg.selected === false) continue
+
+        // Revive any chunks that do not have real result (match / no_match) and are not legitimately cancelled
+        for (const c of seg.chunks) {
+          const inRange = chunkOverlapsSegRange(scan, seg, c.index)
+          const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
+          if (!isGenuinelyFinished && inRange && !c.skippedEarlyStop) {
+            c.status = 'pending'
+          }
+        }
+
         const pending = seg.chunks.filter((c) => c.status === 'pending')
         if (pending.length === 0) continue
 
@@ -1373,7 +1395,8 @@ class Scheduler {
           scan.verifierEnabled === false
             ? []
             : segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
-        seg.status = unresolved.length > 0 ? 'verifying' : 'done'
+        const hasUnfinishedChunks = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
+        seg.status = hasUnfinishedChunks ? 'pending' : (unresolved.length > 0 ? 'verifying' : 'done')
         if (multi) {
           addLog(
             scan,
@@ -1483,18 +1506,18 @@ class Scheduler {
    */
   private async runOrchestratorChunkScan(job: Job, seg: ShortSegmentState) {
     const { scan } = job
-    // Stop any existing orchestrator first to ensure ONLY one orchestrator is active
-    globalOrchestrator.stop()
+    // Reset orchestrator state cleanly for this minute segment
+    globalOrchestrator.reset()
 
     // 1. Register active worker keys into orchestrator (slots 2..13, 15, 16)
     for (const lane of job.lanes) {
       globalOrchestrator.registerKey(lane.idx, lane.apiKey)
     }
 
-    // 2. Load pending & failed chunks for THIS minute segment
-    // Revive any stray scanning or failed status chunks to pending
+    // 2. Load all unfinished chunks for THIS minute segment (must be genuine match or no_match to be considered done)
     for (const c of seg.chunks) {
-      if (c.status === 'scanning' || c.status === 'failed') {
+      const isFinished = c.status === 'match' || c.status === 'no_match'
+      if (!isFinished && c.status !== 'cancelled') {
         c.status = 'pending'
       }
     }

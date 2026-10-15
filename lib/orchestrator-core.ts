@@ -241,8 +241,8 @@ export class ChunkScanOrchestrator {
 
     for (const item of this.chunkQueue) {
       if (item.status === 'pending') {
+        pending++
         if (item.attempts > 0) retrying++
-        else pending++
       } else if (item.status === 'assigned') assigned++
       else if (item.status === 'processing') processing++
       else if (item.status === 'done') done++
@@ -475,7 +475,10 @@ export class ChunkScanOrchestrator {
       }
 
       this.refreshQueueCounts()
-      if (this.state.queue.pending === 0 && this.state.queue.processing === 0 && this.state.queue.assigned === 0) {
+      const hasUnfinishedChunks = this.chunkQueue.some(
+        (c) => c.status === 'pending' || c.status === 'assigned' || c.status === 'processing' || c.status === 'failed',
+      )
+      if (!hasUnfinishedChunks) {
         this.state.phase = 'completed'
         this.log({
           timestamp: Date.now(),
@@ -923,10 +926,19 @@ export class ChunkScanOrchestrator {
     }
   }
 
-  public stop() {
+  public stop(reason?: string) {
     this.stopping = true
     this.state.phase = 'idle'
-    this.log({ timestamp: Date.now(), type: 'info', message: 'Orchestrator stopped by user.' })
+    if (reason && reason.trim()) {
+      this.log({ timestamp: Date.now(), type: 'info', message: reason })
+    }
+  }
+
+  public reset() {
+    this.stopping = false
+    this.pauseRequested = false
+    this.chunkQueue = []
+    this.state = this.createInitialState()
   }
 
   public pause() {
