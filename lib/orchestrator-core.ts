@@ -14,7 +14,6 @@ import {
   ORCHESTRATOR_WORKER_KEY_SLOTS,
   ORCHESTRATOR_RESERVED_KEY_SLOTS,
   ORCHESTRATOR_SKIPPED_KEY_SLOTS,
-  ORCHESTRATOR_37_AVOID_KEY_SLOTS,
   ORCHESTRATOR_CHUNK_TIMEOUT_MS,
   ORCHESTRATOR_CHOKE_TIMEOUT_MS,
   ORCHESTRATOR_BURST_MAX,
@@ -287,16 +286,13 @@ export class ChunkScanOrchestrator {
   }
 
   /**
-   * Choke probe: tiny text request ("Reply with exactly: OK")
+   * Choke probe: tiny text request ("hy")
    * Evaluates latency: <3s = healthy, 3-15s = degrading, 15-60s = critical, >60s/503/hang = skip model.
    * Timeout 120s.
    */
   public async probeChoke(model: string, overrideKeySlot?: number): Promise<ChokeResult> {
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       if (overrideKeySlot) return s === overrideKeySlot
-      if (model === ORCHESTRATOR_SECONDARY_MODEL) {
-        return !(ORCHESTRATOR_37_AVOID_KEY_SLOTS as readonly number[]).includes(s)
-      }
       return true
     })
 
@@ -336,7 +332,7 @@ export class ChunkScanOrchestrator {
 
       const response = await ai.models.generateContent({
         model,
-        contents: 'Reply with exactly: OK',
+        contents: 'hy',
         config: {
           maxOutputTokens: 10,
           temperature: 0,
@@ -346,7 +342,10 @@ export class ChunkScanOrchestrator {
       clearTimeout(timeoutHandle)
       const latencyMs = Date.now() - start
       const text = (response.text || '').trim()
-      const ok = text.toUpperCase().includes('OK')
+      // Choke = capacity probe: ANY successful response means the model is up.
+      // Reply content is irrelevant (model often returns empty) — reaching here
+      // without 503/429/timeout IS the success signal.
+      const ok = true
 
       this.updateModelHealthFromLatency(model, latencyMs, 'success')
       this.log({
@@ -616,9 +615,6 @@ export class ChunkScanOrchestrator {
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       const slotState = this.state.slots[s]
       if (!slotState || slotState.status !== 'idle') return false
-      if (model === ORCHESTRATOR_SECONDARY_MODEL && (ORCHESTRATOR_37_AVOID_KEY_SLOTS as readonly number[]).includes(s)) {
-        return false
-      }
       return true
     })
 

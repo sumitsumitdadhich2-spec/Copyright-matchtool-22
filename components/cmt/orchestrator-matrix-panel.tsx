@@ -260,7 +260,6 @@ export function OrchestratorMatrixPanel() {
               }
 
               // Normal worker key slots: 2..13, 15, 16
-              const avoids37 = [3, 10, 12].includes(slot)
               const statusCls = isProcessing
                 ? 'border-emerald-500/60 bg-emerald-950/30 ring-1 ring-emerald-500/30'
                 : 'border-border/70 bg-card/50'
@@ -297,11 +296,6 @@ export function OrchestratorMatrixPanel() {
                       <span>429: {slotData?.errors429 ?? 0}</span>
                       <span>T/O: {slotData?.timeouts ?? 0}</span>
                     </div>
-                    {avoids37 && (
-                      <span className="mt-1 inline-block text-[9px] text-amber-400/90" title="High 503 observed on 3.7; avoided on 3.7 fallback">
-                        ⚡ Avoid on 3.7
-                      </span>
-                    )}
                   </div>
                 </div>
               )
@@ -340,7 +334,7 @@ export function OrchestratorMatrixPanel() {
                   SECONDARY (Burst 4)
                 </span>
               </div>
-              <p className="mt-1 text-xs text-muted-foreground">Immediate 503 failover • Avoid keys 3, 10, 12 • 20 RPD</p>
+              <p className="mt-1 text-xs text-muted-foreground">Immediate 503 failover • 20 RPD</p>
               <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                 <div className="rounded bg-background/60 p-2">
                   <span className="text-[10px] text-muted-foreground">Max Parallelism</span>

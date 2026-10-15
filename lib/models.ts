@@ -32,9 +32,6 @@ export const ORCHESTRATOR_WORKER_KEY_SLOTS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
 export const ORCHESTRATOR_RESERVED_KEY_SLOTS = [1] as const
 export const ORCHESTRATOR_SKIPPED_KEY_SLOTS = [14] as const
 
-/** On 3.7: avoid key3, key10, key12 (measured high 503 / low headroom) */
-export const ORCHESTRATOR_37_AVOID_KEY_SLOTS = [3, 10, 12] as const
-
 /** Timeouts: Chunks get 600s (slow successes are real); Chokes get 120s */
 export const ORCHESTRATOR_CHUNK_TIMEOUT_MS = 600_000
 export const ORCHESTRATOR_CHOKE_TIMEOUT_MS = 120_000
@@ -61,7 +58,7 @@ export const VERIFY_MODEL_POOL: ModelSpec[] = [
 /** RESCAN models (locked): ONLY gemini-3.5-flash and gemini-3-flash-preview run
  * rescan requests (full-chunk segment hunt). No other models are used for rescan. */
 export const RESCAN_MODEL_POOL: ModelSpec[] = [
-  { id: 'gemini-3.5-flash', rpm: 5, rpd: 500 },
+  { id: 'gemini-3.5-flash', rpm: 5, rpd: 20 },
   { id: 'gemini-3-flash-preview', rpm: 5, rpd: 20 },
 ]
 
@@ -81,7 +78,7 @@ export const GAP_FINDER_AVAILABLE_MODELS: GapFinderModelOption[] = [
   { id: 'gemini-3.7-flash', name: '3.7-shiva', rpd: 20, rpm: 5, description: 'Fast, balanced high-accuracy forensic', recommended: true },
   { id: 'gemini-3.8-flash', name: '3.8-shiva', rpd: 20, rpm: 5, description: 'Deep forensic multi-frame analysis', recommended: true },
   { id: 'gemini-3.6-flash', name: '3.6-shiva', rpd: 20, rpm: 5, description: 'Robust baseline scene comparison', recommended: true },
-  { id: 'gemini-3.5-flash', name: '3.5-shiva', rpd: 500, rpm: 5, description: 'Precision chunk matcher', recommended: false },
+  { id: 'gemini-3.5-flash', name: '3.5-shiva', rpd: 20, rpm: 5, description: 'Precision chunk matcher', recommended: false },
   { id: 'gemini-3.5-flash-lite', name: '3.5-shiva-lite', rpd: 500, rpm: 15, description: 'High daily quota (500 RPD)', recommended: false },
   { id: 'gemini-3.1-flash-lite', name: '3.1-shiva-lite', rpd: 500, rpm: 15, description: 'High daily quota (500 RPD)', recommended: false },
 ]
