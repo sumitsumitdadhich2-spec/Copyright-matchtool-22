@@ -68,6 +68,7 @@ export class ChunkScanOrchestrator {
   private chunkQueue: ChunkQueueItem[] = []
   private keyApiMap = new Map<number, string>()
   private chokeRotationIdx = 0
+  private burstSlotRotationIdx = 0
   private lastBatchTime = 0
   private lastAllModelsChokeTime = Date.now()
   private logs: OrchestratorLogEvent[] = []
@@ -268,7 +269,7 @@ export class ChunkScanOrchestrator {
 
     this.chunkQueue = chunks.map((item) => {
       const idx = typeof item === 'number' ? item : item.index
-      const attempts = typeof item === 'number' ? 0 : item.attempts || 0
+      const attempts = 0
       const lastError = typeof item === 'number' ? undefined : item.lastError
       return {
         index: idx,
@@ -603,7 +604,7 @@ export class ChunkScanOrchestrator {
     // Failed chunks from the previous cycle wait for this new choke→burst cycle.
     let retriedCount = 0
     for (const c of this.chunkQueue) {
-      if (c.status === 'failed') {
+      if (c.status === 'failed' || c.status === 'parked') {
         c.status = 'pending'
         retriedCount++
       }
@@ -635,48 +636,53 @@ export class ChunkScanOrchestrator {
     // Find available key slots that are currently idle
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       const slotState = this.state.slots[s]
-      if (!slotState || slotState.status !== 'idle') return false
+      if (!slotState || slotState.status === 'processing') return false
+      slotState.status = 'idle'
       return true
     })
 
-    const slotsToUse = availableSlots.slice(0, maxParallel)
-    if (slotsToUse.length === 0) {
+    if (availableSlots.length === 0) {
       await new Promise((r) => setTimeout(r, 2000))
       return
     }
 
+    // Rotate starting slot so all worker keys get equal opportunities
+    this.burstSlotRotationIdx = (this.burstSlotRotationIdx + 1) % availableSlots.length
+    const rotatedSlots = [
+      ...availableSlots.slice(this.burstSlotRotationIdx),
+      ...availableSlots.slice(0, this.burstSlotRotationIdx),
+    ]
+    const slotsToUse = rotatedSlots.slice(0, maxParallel)
+
     const inFlightPromises: Promise<void>[] = []
-    let burstAbortedDueTo503 = false
 
     for (let i = 0; i < slotsToUse.length; i++) {
-      if (this.stopping || burstAbortedDueTo503) break
+      if (this.stopping) break
       const slot = slotsToUse[i]
 
       // Stagger launches by 3 seconds between slot workers
       if (i > 0) {
         await new Promise((r) => setTimeout(r, ORCHESTRATOR_BURST_STAGGER_MS))
       }
-      if (this.stopping || burstAbortedDueTo503) break
+      if (this.stopping) break
 
       const slotTask = (async () => {
-        while (!this.stopping && !this.pauseRequested && !burstAbortedDueTo503) {
+        while (!this.stopping && !this.pauseRequested) {
           const nextChunk = this.getNextChunkForAssignment(slot, model)
           if (!nextChunk) break
 
           const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
           if (outcome === '503') {
-            burstAbortedDueTo503 = true
+            // No retry on 503 — break slot task; chunk is queued for next cycle without key cooldown
             this.log({
               timestamp: Date.now(),
               type: 'warn',
               model,
               keySlot: slot,
-              message: `503 High Demand encountered on ${model} (Key ${slot}) — halting burst immediately. Remaining chunks queued for next cycle.`,
+              message: `503 High Demand on Key ${slot} — no retry on this burst; Chunk #${nextChunk.index} queued for next cycle.`,
             })
             break
           } else if (outcome !== 'success') {
-            // Model error (429 / timeout) encountered on this slot:
-            // Break slot loop so the outer orchestrator can evaluate health and failover
             break
           }
         }
@@ -791,32 +797,19 @@ export class ChunkScanOrchestrator {
         this.updateModelHealthFromLatency(model, latencyMs, 'timeout')
       }
 
-      if (chunk.attempts >= 3) {
-        chunk.status = 'parked'
-        this.log({
-          timestamp: Date.now(),
-          type: 'warn',
-          model,
-          keySlot: slot,
-          chunkIndex: chunk.index,
-          outcome: 'parked',
-          message: `Chunk #${chunk.index} failed 3 times — parked to continue remaining scan without blocking.`,
-        })
-      } else {
-        // NO IMMEDIATE RETRY: mark as 'failed'. It will be retried in the NEXT
-        // burst cycle (after next successful choke), prioritized first.
-        chunk.status = 'failed'
-        this.log({
-          timestamp: Date.now(),
-          type: 'chunk',
-          model,
-          keySlot: slot,
-          chunkIndex: chunk.index,
-          outcome,
-          latencyMs,
-          message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. Stopped and queued for retry in next burst cycle.`,
-        })
-      }
+      // 503, 429, and timeouts are transient infrastructure / server errors.
+      // They MUST NEVER park the chunk! Re-queue for next burst cycle retry.
+      chunk.status = 'failed'
+      this.log({
+        timestamp: Date.now(),
+        type: 'chunk',
+        model,
+        keySlot: slot,
+        chunkIndex: chunk.index,
+        outcome,
+        latencyMs,
+        message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. Re-queued for retry in next burst cycle.`,
+      })
     } finally {
       slotState.status = 'idle'
       slotState.activeChunk = null

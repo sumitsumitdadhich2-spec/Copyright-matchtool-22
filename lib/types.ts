@@ -794,6 +794,7 @@ export interface OrchestratorKeySlotState {
   errors429: number
   timeouts: number
   successCount: number
+  cooldownUntil?: number
 }
 
 export interface OrchestratorModelHealth {

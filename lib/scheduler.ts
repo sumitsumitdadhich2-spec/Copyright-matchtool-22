@@ -283,7 +283,7 @@ class Scheduler {
 
         // Any chunk without genuine result (match / no_match) that is in range must be revived to pending
         if (!isGenuinelyFinished) {
-          if (c.status === 'scanning' || c.status === 'failed' || (c.status as string) === 'done' || (c.status as string) === 'error') {
+          if (c.status === 'scanning' || c.status === 'failed' || (c.status as string) === 'done' || (c.status as string) === 'error' || (c.status as string) === 'parked') {
             c.status = 'pending'
           }
           // 'cancelled' is ONLY ever set by skip logic (range, pre-filter, or
