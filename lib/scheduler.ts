@@ -1354,21 +1354,8 @@ class Scheduler {
         // background so the next pass starts instantly.
         this.prepareNextSegment(job, segments, seg.index)
 
-        if (job.resume) {
-          // RESUME PATH: STRICTLY use OrchestratorCore (lib/orchestrator-core.ts).
-          // Legacy scheduler chunk dispatch (this.laneWorker) is NEVER called!
-          await this.runOrchestratorChunkScan(job, seg)
-        } else {
-          // CHUNK PIPELINE: STRICT 1-WORKER-PER-KEY-LANE.
-          // On ANY single API key, exactly ONE chunk request is processed at a time.
-          // No 2 models (e.g. 3.8 and 3.6) can ever execute in parallel on the same key lane!
-          // This eliminates TPM spikes (~3.65 Lakh tokens/min) and protects API keys from quota exhaustion.
-          job.laneFirstSuccess.clear()
-          const lanePromises = job.lanes.map(async (lane) => {
-            await this.laneWorker(job, lane)
-          })
-          await Promise.all(lanePromises)
-        }
+        // MATCHTOOL CHUNK SCAN ORCHESTRATOR: Choke (3.5 -> 3.6 -> 3.7 -> 3.8) -> Burst (10/4/4 within 3s) -> Unlimited Recovery Watch
+        await this.runOrchestratorChunkScan(job, seg)
         // Catch any candidates merged by the very last chunk.
         this.enqueueNewGroups(job)
 
@@ -1543,6 +1530,16 @@ class Scheduler {
 
     // Load chunks into OrchestratorCore
     globalOrchestrator.prepareChunks(scan.id, pendingOrFailed)
+
+    // PRE-WARMING PIPELINE (Zero wait): Pre-upload short minute segment across all keys
+    // and pre-cut pending chunk files in the background so when choke succeeds,
+    // burst requests fire with ZERO wait!
+    for (const lane of job.lanes) {
+      void this.ensureSegmentUri(job, lane, seg).catch(() => {})
+    }
+    for (const item of pendingOrFailed) {
+      void this.ensureChunkFile(scan, item.index).catch(() => {})
+    }
 
     // Stream logs to scan.logs and sync scan.orchestrator
     const unsubscribeLog = globalOrchestrator.onLog((event) => {

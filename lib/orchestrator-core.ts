@@ -17,7 +17,6 @@ import {
   ORCHESTRATOR_CHUNK_TIMEOUT_MS,
   ORCHESTRATOR_CHOKE_TIMEOUT_MS,
   ORCHESTRATOR_BURST_MAX,
-  ORCHESTRATOR_BURST_STAGGER_MS,
 } from './models'
 import { getApiKeyN, incrementModelUsage } from './store'
 
@@ -292,6 +291,29 @@ export class ChunkScanOrchestrator {
    * Evaluates latency: <3s = healthy, 3-15s = degrading, 15-60s = critical, >60s/503/hang = skip model.
    * Timeout 120s.
    */
+  /**
+   * Helper to sleep with interrupt check every 500ms
+   */
+  private async sleepWithInterrupt(ms: number): Promise<void> {
+    const end = Date.now() + ms
+    while (Date.now() < end && !this.stopping) {
+      if (this.pauseRequested) {
+        await new Promise((r) => setTimeout(r, 1000))
+        continue
+      }
+      const remain = end - Date.now()
+      await new Promise((r) => setTimeout(r, Math.min(500, Math.max(50, remain))))
+    }
+  }
+
+  /**
+   * Choke probe: sends tiny text request ("hy").
+   * Evaluates response:
+   * - Must not contain 503 / high demand / overloaded / unavailable / capacity markers
+   * - Must not be empty
+   * - Exact reply text or exact 503 error is logged clearly
+   * - If 503 or error, strictly treated as FAIL (ok = false)
+   */
   public async probeChoke(model: string, overrideKeySlot?: number): Promise<ChokeResult> {
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       if (overrideKeySlot) return s === overrideKeySlot
@@ -336,52 +358,135 @@ export class ChunkScanOrchestrator {
         model,
         contents: 'hy',
         config: {
-          maxOutputTokens: 10,
+          maxOutputTokens: 30,
           temperature: 0,
         },
       })
 
       clearTimeout(timeoutHandle)
       const latencyMs = Date.now() - start
-      const text = (response.text || '').trim()
-      // Choke = capacity probe: ANY successful response means the model is up.
-      // Reply content is irrelevant (model often returns empty) — reaching here
-      // without 503/429/timeout IS the success signal.
-      const ok = true
+      const rawText = (response.text || '').trim()
+      const lowerText = rawText.toLowerCase()
 
-      this.updateModelHealthFromLatency(model, latencyMs, 'success')
+      // Check if text returned by the model contains 503 / overload / high demand indications
+      const textHas503 =
+        lowerText.includes('503') ||
+        lowerText.includes('high demand') ||
+        lowerText.includes('overloaded') ||
+        lowerText.includes('unavailable') ||
+        lowerText.includes('capacity') ||
+        lowerText.includes('spikes in demand') ||
+        lowerText.includes('service unavailable') ||
+        lowerText.includes('resource_exhausted') ||
+        lowerText.includes('quota exceeded')
+
+      // Check candidate finishReason if present
+      const cand0 = response.candidates?.[0]
+      const finishReason = cand0?.finishReason
+
+      // Strict success criterion: NO 503 markers, NOT empty text
+      const ok = !textHas503 && rawText.length > 0 && finishReason !== 'SAFETY'
+
+      if (ok) {
+        this.updateModelHealthFromLatency(model, latencyMs, 'success')
+        this.log({
+          timestamp: Date.now(),
+          type: 'choke',
+          model,
+          keySlot: chosenSlot,
+          outcome: 'success',
+          latencyMs,
+          message: `Choke ${model} on Key ${chosenSlot} SUCCEEDED in ${(latencyMs / 1000).toFixed(2)}s — Model reply: "${rawText}"`,
+        })
+
+        return {
+          ok: true,
+          latencyMs,
+          is503: false,
+          is429: false,
+          isTimeout: false,
+          reply: rawText,
+        }
+      }
+
+      // If text returned 503 or empty
+      const failReason = textHas503
+        ? `Model returned 503/high demand text: "${rawText}"`
+        : `Model returned empty response (${finishReason || 'NO_TEXT'})`
+
+      this.updateModelHealthFromLatency(model, latencyMs, '503')
+      const slotState = this.state.slots[chosenSlot]
+      if (slotState) slotState.errors503++
+
       this.log({
         timestamp: Date.now(),
         type: 'choke',
         model,
         keySlot: chosenSlot,
-        outcome: 'success',
+        outcome: '503',
         latencyMs,
-        message: `Choke ${model} on Key ${chosenSlot} succeeded in ${(latencyMs / 1000).toFixed(2)}s (reply: "${text}").`,
+        message: `Choke ${model} on Key ${chosenSlot} FAILED (503) in ${(latencyMs / 1000).toFixed(2)}s — ${failReason}`,
       })
 
       return {
-        ok,
+        ok: false,
         latencyMs,
-        is503: false,
+        is503: true,
         is429: false,
         isTimeout: false,
-        reply: text,
+        error: failReason,
+        reply: rawText,
       }
     } catch (err: unknown) {
       clearTimeout(timeoutHandle)
       const latencyMs = Date.now() - start
-      const msg = err instanceof Error ? err.message : String(err)
-      const lower = msg.toLowerCase()
+
+      let errDetail = ''
+      let errStatus: number | undefined
+
+      if (err instanceof Error) {
+        errDetail = err.message
+      } else if (err && typeof err === 'object') {
+        const obj = err as Record<string, unknown>
+        errDetail = (obj.message as string) || (obj.statusText as string) || ''
+        if (obj.error && typeof obj.error === 'object') {
+          const inner = obj.error as Record<string, unknown>
+          errDetail = (inner.message as string) || errDetail
+          if (typeof inner.code === 'number') errStatus = inner.code
+        }
+        if (typeof obj.status === 'number') errStatus = obj.status
+        if (typeof obj.code === 'number') errStatus = obj.code
+        if (!errDetail) {
+          try {
+            errDetail = JSON.stringify(err)
+          } catch {
+            errDetail = String(err)
+          }
+        }
+      } else {
+        errDetail = String(err)
+      }
+
+      const lower = errDetail.toLowerCase()
       const is503 =
+        errStatus === 503 ||
         lower.includes('503') ||
         lower.includes('high demand') ||
         lower.includes('unavailable') ||
         lower.includes('overloaded') ||
         lower.includes('capacity') ||
-        lower.includes('spikes in demand')
-      const is429 = lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted')
-      const isTimeout = abortCtrl.signal.aborted || lower.includes('timeout') || lower.includes('aborted')
+        lower.includes('spikes in demand') ||
+        lower.includes('service unavailable')
+      const is429 =
+        errStatus === 429 ||
+        lower.includes('429') ||
+        lower.includes('quota') ||
+        lower.includes('resource_exhausted')
+      const isTimeout =
+        abortCtrl.signal.aborted ||
+        lower.includes('timeout') ||
+        lower.includes('timed out') ||
+        lower.includes('aborted')
 
       let outcome: '503' | '429' | 'timeout' = '503'
       if (is429) outcome = '429'
@@ -403,7 +508,7 @@ export class ChunkScanOrchestrator {
         keySlot: chosenSlot,
         outcome,
         latencyMs,
-        message: `Choke ${model} on Key ${chosenSlot} failed with ${outcome.toUpperCase()} (${(latencyMs / 1000).toFixed(2)}s): ${msg.slice(0, 120)}`,
+        message: `Choke ${model} on Key ${chosenSlot} FAILED (${outcome.toUpperCase()}) in ${(latencyMs / 1000).toFixed(2)}s — Error: "${errDetail.slice(0, 160)}"`,
       })
 
       return {
@@ -412,7 +517,7 @@ export class ChunkScanOrchestrator {
         is503,
         is429,
         isTimeout,
-        error: msg,
+        error: errDetail,
       }
     }
   }
@@ -462,7 +567,15 @@ export class ChunkScanOrchestrator {
 
   /**
    * Main Orchestrator Loop:
-   * Choke 3.6 -> Burst 3.6 -> 503 failover to 3.7 -> probe 3.8 -> 503 all stop -> Unlimited wait on 3.5.
+   * 1. 3.5 Flash sentinel choke (probes every 1 min).
+   * 2. If 3.5 succeeds -> immediately choke 3.6 Primary.
+   * 3. If 3.6 succeeds -> launch 10 burst requests immediately (<3s).
+   *    (While 3.6/3.7/3.8 burst is running, the 3.5 1-min choke loop is OFF).
+   * 4. If 3.6 fails (503) -> immediately choke 3.7 Secondary.
+   * 5. If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
+   * 6. If 3.7 fails (503) -> immediately choke 3.8 Tertiary.
+   * 7. If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
+   * 8. If 3.8 fails (503) -> UNLIMITED WAIT (3.5 Flash 1-min choke loop restarts).
    */
   public async runOrchestrationLoop(): Promise<void> {
     this.stopping = false
@@ -477,7 +590,7 @@ export class ChunkScanOrchestrator {
 
       this.refreshQueueCounts()
       const hasUnfinishedChunks = this.chunkQueue.some(
-        (c) => c.status === 'pending' || c.status === 'assigned' || c.status === 'processing' || c.status === 'failed',
+        (c) => c.status === 'pending' || c.status === 'assigned' || c.status === 'processing' || c.status === 'failed' || c.status === 'parked',
       )
       if (!hasUnfinishedChunks) {
         this.state.phase = 'completed'
@@ -489,21 +602,57 @@ export class ChunkScanOrchestrator {
         break
       }
 
-      // Check if 15 minutes elapsed to re-choke all models
-      if (Date.now() - this.lastAllModelsChokeTime > 15 * 60_000) {
-        this.lastAllModelsChokeTime = Date.now()
-        void this.reChokeAllModels()
+      // ==============================================================
+      // STEP 1: 3.5 FLASH SENTINEL CHOKE (1-min loop)
+      // Probes gemini-3.5-flash with message "hy".
+      // If 3.5 fails: wait 60s (1 min) and re-probe 3.5.
+      // ==============================================================
+      this.state.phase = 'choke_canary'
+      this.state.activeModel = ORCHESTRATOR_CANARY_MODEL
+      this.state.canaryActive = true
+      this.log({
+        timestamp: Date.now(),
+        type: 'choke',
+        model: ORCHESTRATOR_CANARY_MODEL,
+        message: `Phase [choke_canary]: Probing 3.5 Flash sentinel (${ORCHESTRATOR_CANARY_MODEL}) with "hy"...`,
+      })
+
+      const canaryChoke = await this.probeChoke(ORCHESTRATOR_CANARY_MODEL)
+
+      if (!canaryChoke.ok) {
+        this.log({
+          timestamp: Date.now(),
+          type: 'warn',
+          model: ORCHESTRATOR_CANARY_MODEL,
+          message: `Canary 3.5 choke failed (${canaryChoke.error || '503 Overload'}). Waiting 60s (1 min) before next 3.5 choke...`,
+        })
+        await this.sleepWithInterrupt(60_000)
+        continue
       }
 
-      // 1. PRIMARY: Probe 3.6
+      this.state.canaryActive = false
+      this.log({
+        timestamp: Date.now(),
+        type: 'info',
+        model: ORCHESTRATOR_CANARY_MODEL,
+        message: `Canary 3.5 choke SUCCEEDED (reply: "${canaryChoke.reply}"). Immediately probing Primary 3.6...`,
+      })
+
+      // ==============================================================
+      // STEP 2: PRIMARY 3.6 CHOKE PROBE
+      // Probes gemini-3.6-flash with message "hy".
+      // If 3.6 succeeds -> launch 10 burst requests immediately (<3s).
+      // (3.5 1-min choke is OFF while 3.6 burst is running).
+      // ==============================================================
       this.state.phase = 'choke_primary'
       this.state.activeModel = ORCHESTRATOR_PRIMARY_MODEL
       this.log({
         timestamp: Date.now(),
         type: 'choke',
         model: ORCHESTRATOR_PRIMARY_MODEL,
-        message: `Phase [choke_primary]: Probing primary model ${ORCHESTRATOR_PRIMARY_MODEL}...`,
+        message: `Phase [choke_primary]: Probing Primary model ${ORCHESTRATOR_PRIMARY_MODEL} with "hy"...`,
       })
+
       const primaryChoke = await this.probeChoke(ORCHESTRATOR_PRIMARY_MODEL)
 
       if (primaryChoke.ok) {
@@ -512,18 +661,23 @@ export class ChunkScanOrchestrator {
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_PRIMARY_MODEL,
-          message: `Phase [burst_primary]: Launching burst pipeline on ${ORCHESTRATOR_PRIMARY_MODEL} (max 10 parallel, 3s stagger)...`,
+          message: `Phase [burst_primary]: Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 10 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
         })
-        await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL)
+        await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 10)
         continue
       }
 
-      // 2. 503 or Failover -> Immediately probe 3.7 (NO canary delay!)
+      // ==============================================================
+      // STEP 3: SECONDARY 3.7 CHOKE PROBE (on 3.6 failure)
+      // Probes gemini-3.7-flash with message "hy".
+      // If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
+      // (3.5 1-min choke is OFF while 3.7 burst is running).
+      // ==============================================================
       this.log({
         timestamp: Date.now(),
         type: 'failover',
         model: ORCHESTRATOR_PRIMARY_MODEL,
-        message: `Primary 3.6 choked/unavailable (${primaryChoke.error || '503'}). Immediately failing over to Secondary 3.7.`,
+        message: `Primary 3.6 choke failed (${primaryChoke.error || '503 High Demand'}). Immediately probing Secondary 3.7...`,
       })
 
       this.state.phase = 'choke_secondary'
@@ -532,8 +686,9 @@ export class ChunkScanOrchestrator {
         timestamp: Date.now(),
         type: 'choke',
         model: ORCHESTRATOR_SECONDARY_MODEL,
-        message: `Phase [choke_secondary]: Probing secondary model ${ORCHESTRATOR_SECONDARY_MODEL}...`,
+        message: `Phase [choke_secondary]: Probing Secondary model ${ORCHESTRATOR_SECONDARY_MODEL} with "hy"...`,
       })
+
       const secChoke = await this.probeChoke(ORCHESTRATOR_SECONDARY_MODEL)
 
       if (secChoke.ok) {
@@ -542,18 +697,23 @@ export class ChunkScanOrchestrator {
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_SECONDARY_MODEL,
-          message: `Phase [burst_secondary]: Launching burst pipeline on ${ORCHESTRATOR_SECONDARY_MODEL}...`,
+          message: `Phase [burst_secondary]: Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
         })
-        await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL)
+        await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL, 4)
         continue
       }
 
-      // 3. Secondary 3.7 failed -> Probe Tertiary 3.8
+      // ==============================================================
+      // STEP 4: TERTIARY 3.8 CHOKE PROBE (on 3.7 failure)
+      // Probes gemini-3.8-flash with message "hy".
+      // If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
+      // (3.5 1-min choke is OFF while 3.8 burst is running).
+      // ==============================================================
       this.log({
         timestamp: Date.now(),
         type: 'failover',
         model: ORCHESTRATOR_SECONDARY_MODEL,
-        message: `Secondary 3.7 choked/unavailable. Attempting Tertiary 3.8.`,
+        message: `Secondary 3.7 choke failed with 503 (${secChoke.error || '503 High Demand'}). Immediately probing Tertiary 3.8...`,
       })
 
       this.state.phase = 'choke_tertiary'
@@ -562,8 +722,9 @@ export class ChunkScanOrchestrator {
         timestamp: Date.now(),
         type: 'choke',
         model: ORCHESTRATOR_TERTIARY_MODEL,
-        message: `Phase [choke_tertiary]: Probing tertiary model ${ORCHESTRATOR_TERTIARY_MODEL}...`,
+        message: `Phase [choke_tertiary]: Probing Tertiary model ${ORCHESTRATOR_TERTIARY_MODEL} with "hy"...`,
       })
+
       const tertChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
 
       if (tertChoke.ok) {
@@ -572,36 +733,42 @@ export class ChunkScanOrchestrator {
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_TERTIARY_MODEL,
-          message: `Phase [burst_tertiary]: Launching burst pipeline on ${ORCHESTRATOR_TERTIARY_MODEL}...`,
+          message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
         })
-        await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL)
+        await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL, 4)
         continue
       }
 
-      // 4. ALL STOP -> Unlimited Wait (Recovery Watch with 3.5 Canary)
+      // ==============================================================
+      // STEP 5: UNLIMITED WAIT (All 3.6, 3.7, 3.8 failed with 503)
+      // Resumes 3.5 Flash 1-min choke loop.
+      // ==============================================================
       this.log({
         timestamp: Date.now(),
         type: 'warn',
-        message: `All chunk worker models (3.6, 3.7, 3.8) are down/overloaded! Entering UNLIMITED WAIT recovery watch on 3.5 canary.`,
+        message: `All worker models (3.6, 3.7, 3.8) are in 503 / High Demand. Entering UNLIMITED WAIT — resuming 3.5 Flash 1-min choke loop.`,
       })
-      await this.enterUnlimitedWait()
+
+      this.state.phase = 'recovery_watch'
+      this.state.canaryActive = true
+      this.state.activeModel = ORCHESTRATOR_CANARY_MODEL
+      await this.sleepWithInterrupt(60_000)
     }
   }
 
   /**
    * Execute Burst on a given model:
-   * - Max parallelism: 10 on 3.6, 4 on 3.7 (avoiding keys 3,10,12), 4 on 3.8.
-   * - 3-second stagger between starts.
-   * - Continuous pipeline: as each completes, immediately assigns next chunk without waiting for whole batch.
-   * - Re-chokes before each new batch.
+   * - Parallelism: 10 on 3.6, 4 on 3.7, 4 on 3.8.
+   * - IMMEDIATE LAUNCH: all requests dispatched within 3 seconds (<200ms stagger between worker starts).
+   * - While burst is executing, 3.5 1-min choke is OFF.
+   * - If any chunk encounters 503:
+   *     NO retry on this burst, NO cooldown on key. Chunk is queued for next cycle.
    */
-  private async executeBurst(model: string): Promise<void> {
-    const health = this.state.models[model]
-    const maxParallel = health ? health.effectiveParallelism : 4
+  private async executeBurst(model: string, burstCountOverride?: number): Promise<void> {
+    const defaultMax = model === ORCHESTRATOR_PRIMARY_MODEL ? 10 : 4
+    const maxParallel = burstCountOverride || ORCHESTRATOR_BURST_MAX[model] || defaultMax
 
-    // NEW BURST CYCLE: reset 'failed' chunks back to 'pending' so they are
-    // retried FIRST in this cycle (getNextChunkForAssignment prioritizes retries).
-    // Failed chunks from the previous cycle wait for this new choke→burst cycle.
+    // Reset failed/parked chunks back to pending so they are retried first in this cycle
     let retriedCount = 0
     for (const c of this.chunkQueue) {
       if (c.status === 'failed' || c.status === 'parked') {
@@ -614,34 +781,30 @@ export class ChunkScanOrchestrator {
         timestamp: Date.now(),
         type: 'info',
         model,
-        message: `New burst cycle: ${retriedCount} failed chunk(s) re-queued for retry (prioritized first).`,
+        message: `New burst cycle: ${retriedCount} previously-failed chunk(s) re-queued for retry (prioritized first).`,
       })
       this.refreshQueueCounts()
     }
 
-    // Respect 60s minimum interval between burst batches on same model to avoid 429 wall
-    const elapsedSinceLastBatch = Date.now() - this.lastBatchTime
-    if (elapsedSinceLastBatch < 60_000 && this.lastBatchTime > 0) {
-      const waitMs = 60_000 - elapsedSinceLastBatch
-      this.log({
-        timestamp: Date.now(),
-        type: 'info',
-        model,
-        message: `Pacing buffer: waiting ${(waitMs / 1000).toFixed(1)}s to maintain >60s burst spacing.`,
-      })
-      await new Promise((r) => setTimeout(r, waitMs))
-    }
     this.lastBatchTime = Date.now()
 
-    // Find available key slots that are currently idle
+    // Find available worker key slots that are currently idle (slots 2..13, 15, 16)
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       const slotState = this.state.slots[s]
-      if (!slotState || slotState.status === 'processing') return false
+      if (!slotState || slotState.status === 'processing' || slotState.status === 'reserved' || slotState.status === 'skipped') {
+        return false
+      }
       slotState.status = 'idle'
       return true
     })
 
     if (availableSlots.length === 0) {
+      this.log({
+        timestamp: Date.now(),
+        type: 'warn',
+        model,
+        message: 'No idle worker key slots available to launch burst.',
+      })
       await new Promise((r) => setTimeout(r, 2000))
       return
     }
@@ -652,7 +815,21 @@ export class ChunkScanOrchestrator {
       ...availableSlots.slice(this.burstSlotRotationIdx),
       ...availableSlots.slice(0, this.burstSlotRotationIdx),
     ]
+
     const slotsToUse = rotatedSlots.slice(0, maxParallel)
+
+    // RAPID LAUNCH: all burst requests must be dispatched within 3 seconds!
+    // Stagger is 150-200ms per slot so all 10 requests fire within 2.0 seconds.
+    const launchStaggerMs = slotsToUse.length > 1
+      ? Math.min(200, Math.floor(2200 / slotsToUse.length))
+      : 0
+
+    this.log({
+      timestamp: Date.now(),
+      type: 'info',
+      model,
+      message: `Launching ${slotsToUse.length} parallel burst requests on ${model} across Keys [${slotsToUse.join(', ')}] within 3s...`,
+    })
 
     const inFlightPromises: Promise<void>[] = []
 
@@ -660,9 +837,9 @@ export class ChunkScanOrchestrator {
       if (this.stopping) break
       const slot = slotsToUse[i]
 
-      // Stagger launches by 3 seconds between slot workers
-      if (i > 0) {
-        await new Promise((r) => setTimeout(r, ORCHESTRATOR_BURST_STAGGER_MS))
+      // Rapid launch stagger (<200ms) to spread initial handshake within 2-3s window
+      if (i > 0 && launchStaggerMs > 0) {
+        await new Promise((r) => setTimeout(r, launchStaggerMs))
       }
       if (this.stopping) break
 
@@ -673,13 +850,13 @@ export class ChunkScanOrchestrator {
 
           const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
           if (outcome === '503') {
-            // No retry on 503 — break slot task; chunk is queued for next cycle without key cooldown
+            // 503 High Demand: no retry on this burst, key has NO cooldown, chunk queued for next cycle
             this.log({
               timestamp: Date.now(),
               type: 'warn',
               model,
               keySlot: slot,
-              message: `503 High Demand on Key ${slot} — no retry on this burst; Chunk #${nextChunk.index} queued for next cycle.`,
+              message: `503 High Demand on Key ${slot} — no retry on this burst; Key has NO cooldown. Chunk #${nextChunk.index} queued for next cycle.`,
             })
             break
           } else if (outcome !== 'success') {

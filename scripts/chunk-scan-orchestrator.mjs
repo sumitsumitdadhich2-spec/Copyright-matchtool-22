@@ -31,7 +31,6 @@ const AVOID_37_SLOTS = [3, 10, 12]
 
 const CHOKE_TIMEOUT_MS = 120_000 // 120s for tiny probes
 const CHUNK_TIMEOUT_MS = 600_000 // 600s (10 min) for chunk video requests
-const BURST_STAGGER_MS = 3_000
 
 // ---------- Parse CLI arguments ----------
 const args = process.argv.slice(2)
@@ -102,7 +101,7 @@ async function probeChoke(model, keySlot) {
         Cookie: cookie,
       },
       body: JSON.stringify({
-        prompt: 'Reply with exactly: OK',
+        prompt: 'hy',
         model,
         keySelection: 'slot',
         keySlot,
@@ -116,22 +115,48 @@ async function probeChoke(model, keySlot) {
 
     if (res.ok) {
       const reply = (data.reply || '').trim()
-      const ok = reply.toUpperCase().includes('OK')
-      log('CHOKE', `Choke ${model} (Slot ${keySlot}) SUCCESS in ${(latencyMs / 1000).toFixed(2)}s: "${reply}"`, {
+      const lowerReply = reply.toLowerCase()
+      const textHas503 =
+        lowerReply.includes('503') ||
+        lowerReply.includes('high demand') ||
+        lowerReply.includes('overloaded') ||
+        lowerReply.includes('unavailable') ||
+        lowerReply.includes('capacity') ||
+        lowerReply.includes('spikes in demand') ||
+        lowerReply.includes('service unavailable') ||
+        lowerReply.includes('resource_exhausted') ||
+        lowerReply.includes('quota exceeded')
+
+      const ok = !textHas503 && reply.length > 0
+
+      if (ok) {
+        log('CHOKE', `Choke ${model} (Slot ${keySlot}) SUCCEEDED in ${(latencyMs / 1000).toFixed(2)}s — Model reply: "${reply}"`, {
+          latencyMs,
+          model,
+          keySlot,
+          outcome: 'success',
+          reply,
+        })
+        return { ok: true, latencyMs, outcome: 'success', reply, data }
+      }
+
+      const failReason = textHas503 ? `503 High Demand in reply: "${reply}"` : 'Empty response'
+      log('CHOKE', `Choke ${model} (Slot ${keySlot}) FAILED (503) in ${(latencyMs / 1000).toFixed(2)}s — ${failReason}`, {
         latencyMs,
         model,
         keySlot,
-        outcome: 'success',
+        outcome: '503',
       })
-      return { ok, latencyMs, outcome: 'success', data }
+      return { ok: false, latencyMs, outcome: '503', is503: true, is429: false, error: failReason }
     }
 
     const errStr = data.error || ''
-    const is503 = Boolean(data.is503) || errStr.includes('503') || errStr.includes('high demand')
-    const is429 = Boolean(data.is429) || errStr.includes('429') || errStr.includes('quota')
+    const lower = errStr.toLowerCase()
+    const is503 = Boolean(data.is503) || lower.includes('503') || lower.includes('high demand') || lower.includes('unavailable') || lower.includes('overloaded')
+    const is429 = Boolean(data.is429) || lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted')
     const outcome = is503 ? '503' : is429 ? '429' : 'error'
 
-    log('CHOKE', `Choke ${model} (Slot ${keySlot}) FAILED (${outcome}) in ${(latencyMs / 1000).toFixed(2)}s: ${errStr.slice(0, 100)}`, {
+    log('CHOKE', `Choke ${model} (Slot ${keySlot}) FAILED (${outcome.toUpperCase()}) in ${(latencyMs / 1000).toFixed(2)}s — Error: "${errStr.slice(0, 120)}"`, {
       latencyMs,
       model,
       keySlot,
@@ -279,45 +304,51 @@ async function main() {
       break
     }
 
-    // 1. PRIMARY: Probe 3.6
-    log('ORCH', `Probing Primary Model (${PRIMARY_MODEL})...`)
+    // 1. CANARY SENTINEL: Probe 3.5 Canary (every 1 min)
+    log('ORCH', `Probing 3.5 Canary Sentinel (${CANARY_MODEL}) with "hy"...`)
+    const canaryChoke = await probeChoke(CANARY_MODEL, getChokeSlot(CANARY_MODEL))
+
+    if (!canaryChoke.ok) {
+      log('ORCH', `Canary 3.5 choked (${canaryChoke.outcome}). Waiting 60s (1 min) before next 3.5 choke...`)
+      await new Promise((r) => setTimeout(r, 60_000))
+      continue
+    }
+
+    log('ORCH', `Canary 3.5 SUCCEEDED (reply: "${canaryChoke.reply}"). Immediately probing Primary 3.6...`)
+
+    // 2. PRIMARY: Probe 3.6
+    log('ORCH', `Probing Primary Model (${PRIMARY_MODEL}) with "hy"...`)
     const primaryChoke = await probeChoke(PRIMARY_MODEL, getChokeSlot(PRIMARY_MODEL))
 
     if (primaryChoke.ok) {
-      log('ORCH', `Primary 3.6 is HEALTHY. Launching burst (up to 10 parallel)...`)
+      log('ORCH', `Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 10 burst requests within 3s (3.5 choke is OFF during burst)...`)
       await launchBurst(PRIMARY_MODEL, 10)
       continue
     }
 
-    // 2. 503 -> Immediately Probe 3.7
-    log('ORCH', `Primary 3.6 choked (${primaryChoke.outcome}). Immediate failover to Secondary (${SECONDARY_MODEL})...`)
+    // 3. 503 on 3.6 -> Immediately Probe 3.7
+    log('ORCH', `Primary 3.6 choked (${primaryChoke.error || '503'}). Immediate failover to Secondary (${SECONDARY_MODEL})...`)
     const secChoke = await probeChoke(SECONDARY_MODEL, getChokeSlot(SECONDARY_MODEL))
 
     if (secChoke.ok) {
-      log('ORCH', `Secondary 3.7 is HEALTHY. Checking Tertiary 3.8 in parallel...`)
-      const tertChoke = await probeChoke(TERTIARY_MODEL, getChokeSlot(TERTIARY_MODEL))
-      if (tertChoke.ok) {
-        log('ORCH', `Both 3.7 and 3.8 are ready. Launching combined burst (4+4 = 8 parallel)...`)
-        await Promise.all([launchBurst(SECONDARY_MODEL, 4), launchBurst(TERTIARY_MODEL, 4)])
-      } else {
-        await launchBurst(SECONDARY_MODEL, 4)
-      }
+      log('ORCH', `Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests within 3s (3.5 choke is OFF during burst)...`)
+      await launchBurst(SECONDARY_MODEL, 4)
       continue
     }
 
-    // 3. 503 -> Probe 3.8
-    log('ORCH', `Secondary 3.7 choked (${secChoke.outcome}). Attempting Tertiary (${TERTIARY_MODEL})...`)
+    // 4. 503 on 3.7 -> Probe 3.8
+    log('ORCH', `Secondary 3.7 choked (${secChoke.error || '503'}). Attempting Tertiary (${TERTIARY_MODEL})...`)
     const tertChoke = await probeChoke(TERTIARY_MODEL, getChokeSlot(TERTIARY_MODEL))
 
     if (tertChoke.ok) {
-      log('ORCH', `Tertiary 3.8 is HEALTHY. Launching burst (up to 4 parallel)...`)
+      log('ORCH', `Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests within 3s (3.5 choke is OFF during burst)...`)
       await launchBurst(TERTIARY_MODEL, 4)
       continue
     }
 
-    // 4. ALL STOP -> Unlimited Wait on 3.5 Canary
-    log('ORCH', `ALL MODELS ARE DOWN (503 / high demand)! Entering UNLIMITED WAIT recovery watch on 3.5 canary...`)
-    await unlimitedWaitRecovery()
+    // 5. ALL STOP -> Unlimited Wait (resuming 3.5 1-min choke loop)
+    log('ORCH', `ALL MODELS ARE IN 503 / HIGH DEMAND! Entering UNLIMITED WAIT — resuming 3.5 Flash 1-min loop...`)
+    await new Promise((r) => setTimeout(r, 60_000))
   }
 
   const durationMin = ((Date.now() - startTime) / 60_000).toFixed(1)
@@ -335,8 +366,15 @@ async function main() {
       return
     }
 
+    const launchStaggerMs = freeSlots.length > 1
+      ? Math.min(200, Math.floor(2200 / freeSlots.length))
+      : 0
+
+    log('BURST', `Dispatching ${freeSlots.length} parallel requests on ${model} within 3s...`)
+
     const tasks = []
-    for (const slot of freeSlots) {
+    for (let i = 0; i < freeSlots.length; i++) {
+      const slot = freeSlots[i]
       // Pick next chunk: retry first, then new
       let chunk = queue.find((c) => c.status === 'pending' && c.attempts > 0)
       if (!chunk) chunk = queue.find((c) => c.status === 'pending')
@@ -348,8 +386,10 @@ async function main() {
       chunk.attempts++
       slotBusy.set(slot, true)
 
-      // Stagger start by 3 seconds
-      await new Promise((r) => setTimeout(r, BURST_STAGGER_MS))
+      // Stagger start within 2-3s window
+      if (i > 0 && launchStaggerMs > 0) {
+        await new Promise((r) => setTimeout(r, launchStaggerMs))
+      }
 
       const p = (async () => {
         const dummyPath = path.join(CHUNKS_DIR, `chunk-${String(chunk.index).padStart(4, '0')}.mp4`)
@@ -375,23 +415,6 @@ async function main() {
 
     if (tasks.length > 0) {
       await Promise.all(tasks)
-    }
-  }
-
-  async function unlimitedWaitRecovery() {
-    while (true) {
-      log('CANARY', `Recovery Watch: probing 3.5 canary...`)
-      const canaryResult = await probeChoke(CANARY_MODEL, getChokeSlot(CANARY_MODEL))
-      if (canaryResult.ok) {
-        log('CANARY', `3.5 Canary succeeded! Immediately confirming Primary 3.6...`)
-        const primaryConfirm = await probeChoke(PRIMARY_MODEL, getChokeSlot(PRIMARY_MODEL))
-        if (primaryConfirm.ok) {
-          log('CANARY', `Primary 3.6 capacity RESTORED! Resuming primary execution.`)
-          return
-        }
-      }
-      log('CANARY', `Models still recovering. Waiting 60s before next canary check...`)
-      await new Promise((r) => setTimeout(r, 60_000))
     }
   }
 }

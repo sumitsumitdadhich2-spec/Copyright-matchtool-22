@@ -43,8 +43,8 @@ export const ORCHESTRATOR_BURST_MAX: Record<string, number> = {
   [ORCHESTRATOR_TERTIARY_MODEL]: 4,
 }
 
-/** Stagger between chunk launches in a burst */
-export const ORCHESTRATOR_BURST_STAGGER_MS = 3_000
+/** Stagger between chunk launches in a burst: 200ms so all 10 requests launch within 2-3 seconds */
+export const ORCHESTRATOR_BURST_STAGGER_MS = 200
 
 /** VERIFY models (locked): gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY.
  * Dono ki daily limit 500 RPD each hai — har model ek sath 3 parallel requests handle kar sakta hai.

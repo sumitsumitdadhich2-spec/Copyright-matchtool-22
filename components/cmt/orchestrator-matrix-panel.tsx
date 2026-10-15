@@ -42,9 +42,9 @@ export function OrchestratorMatrixPanel() {
         const r = json.result
         const latency = (r.latencyMs / 1000).toFixed(2)
         if (r.ok) {
-          setProbeResult(`✅ ${modelId} Choke OK in ${latency}s`)
+          setProbeResult(`✅ ${modelId} Choke OK in ${latency}s — Reply: "${r.reply || 'hy'}"`)
         } else {
-          setProbeResult(`⚠️ ${modelId} Choke Failed: ${r.error || '503/429'} (${latency}s)`)
+          setProbeResult(`⚠️ ${modelId} Choke Failed [${r.is503 ? '503' : 'Error'}]: ${r.error || '503 High Demand'} (${latency}s)`)
         }
       } else {
         setProbeResult(`❌ Error: ${json.error || 'Failed'}`)
@@ -76,7 +76,7 @@ export function OrchestratorMatrixPanel() {
               </span>
             </div>
             <p className="text-xs text-muted-foreground">
-              Independent quotas • Primary 3.6 (Burst 10) • 503 Failover to 3.7 • 3.5 Canary Recovery
+              3.5 Sentinel (1-min loop) • Primary 3.6 (Burst 10) • Secondary 3.7 (Burst 4) • Tertiary 3.8 (Burst 4) • Instant &lt;3s Dispatch
             </p>
           </div>
         </div>
