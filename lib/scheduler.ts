@@ -1575,6 +1575,37 @@ class Scheduler {
             c.status = 'pending'
           }
           await this.processChunk(job, lane, modelSpec, chunkIndex)
+
+          const finishedChunk = scan.chunks[chunkIndex]
+          const isSuccess = finishedChunk && (finishedChunk.status === 'match' || finishedChunk.status === 'no_match')
+          if (!isSuccess) {
+            const lastErr = finishedChunk?.lastError || 'Chunk scan did not complete with match or no_match'
+            const lower = lastErr.toLowerCase()
+            const is503 =
+              lower.includes('503') ||
+              lower.includes('high demand') ||
+              lower.includes('overloaded') ||
+              lower.includes('unavailable') ||
+              lower.includes('capacity') ||
+              lower.includes('spikes in demand')
+            const is429 =
+              lower.includes('429') ||
+              lower.includes('quota') ||
+              lower.includes('resource_exhausted')
+            const isTimeout =
+              signal.aborted ||
+              lower.includes('timeout') ||
+              lower.includes('timed out')
+
+            return {
+              ok: false,
+              is503,
+              is429,
+              isTimeout,
+              error: lastErr,
+            }
+          }
+
           // Catch any candidates merged by this chunk
           this.enqueueNewGroups(job)
           return { ok: true }
@@ -1589,7 +1620,9 @@ class Scheduler {
             lower.includes('503') ||
             lower.includes('high demand') ||
             lower.includes('overloaded') ||
-            lower.includes('unavailable')
+            lower.includes('unavailable') ||
+            lower.includes('capacity') ||
+            lower.includes('spikes in demand')
           const is429 =
             lower.includes('429') ||
             lower.includes('quota') ||
@@ -3118,7 +3151,11 @@ class Scheduler {
       }
 
       // Process this chunk on model `m`
-      await this.processChunk(job, lane, m, chunkIndex)
+      try {
+        await this.processChunk(job, lane, m, chunkIndex)
+      } catch {
+        /* error handled & recorded inside processChunk */
+      }
     }
   }
 
@@ -3806,6 +3843,7 @@ class Scheduler {
           this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, e.message.slice(0, 80), minutePrefix)
         }
         this.mark(job)
+        throw e
       } finally {
         globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
         if (releaseGlobalLock) releaseGlobalLock(60, CHUNK_COOLDOWN_MS)

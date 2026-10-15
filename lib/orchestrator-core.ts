@@ -69,7 +69,7 @@ export class ChunkScanOrchestrator {
   private keyApiMap = new Map<number, string>()
   private chokeRotationIdx = 0
   private lastBatchTime = 0
-  private lastAllModelsChokeTime = 0
+  private lastAllModelsChokeTime = Date.now()
   private logs: OrchestratorLogEvent[] = []
   private chunkExecutor: ChunkExecutor | null = null
 
@@ -263,6 +263,7 @@ export class ChunkScanOrchestrator {
     this.activeScanId = scanId
     this.stopping = false
     this.pauseRequested = false
+    this.lastAllModelsChokeTime = Date.now()
     this.initSlots()
 
     this.chunkQueue = chunks.map((item) => {
@@ -371,7 +372,13 @@ export class ChunkScanOrchestrator {
       const latencyMs = Date.now() - start
       const msg = err instanceof Error ? err.message : String(err)
       const lower = msg.toLowerCase()
-      const is503 = lower.includes('503') || lower.includes('high demand') || lower.includes('unavailable')
+      const is503 =
+        lower.includes('503') ||
+        lower.includes('high demand') ||
+        lower.includes('unavailable') ||
+        lower.includes('overloaded') ||
+        lower.includes('capacity') ||
+        lower.includes('spikes in demand')
       const is429 = lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted')
       const isTimeout = abortCtrl.signal.aborted || lower.includes('timeout') || lower.includes('aborted')
 
@@ -533,16 +540,7 @@ export class ChunkScanOrchestrator {
           model: ORCHESTRATOR_SECONDARY_MODEL,
           message: `Phase [burst_secondary]: Launching burst pipeline on ${ORCHESTRATOR_SECONDARY_MODEL}...`,
         })
-        // Simultaneously probe 3.8: if ready, also burst 3.8
-        const tertiaryChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
-        if (tertiaryChoke.ok) {
-          await Promise.all([
-            this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL),
-            this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL),
-          ])
-        } else {
-          await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL)
-        }
+        await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL)
         continue
       }
 
@@ -645,24 +643,36 @@ export class ChunkScanOrchestrator {
     }
 
     const inFlightPromises: Promise<void>[] = []
+    let burstAbortedDueTo503 = false
 
     for (let i = 0; i < slotsToUse.length; i++) {
-      if (this.stopping) break
+      if (this.stopping || burstAbortedDueTo503) break
       const slot = slotsToUse[i]
 
       // Stagger launches by 3 seconds between slot workers
       if (i > 0) {
         await new Promise((r) => setTimeout(r, ORCHESTRATOR_BURST_STAGGER_MS))
       }
+      if (this.stopping || burstAbortedDueTo503) break
 
       const slotTask = (async () => {
-        while (!this.stopping && !this.pauseRequested) {
+        while (!this.stopping && !this.pauseRequested && !burstAbortedDueTo503) {
           const nextChunk = this.getNextChunkForAssignment(slot, model)
           if (!nextChunk) break
 
           const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
-          if (outcome !== 'success') {
-            // Model error (503 / 429 / timeout) encountered on this slot:
+          if (outcome === '503') {
+            burstAbortedDueTo503 = true
+            this.log({
+              timestamp: Date.now(),
+              type: 'warn',
+              model,
+              keySlot: slot,
+              message: `503 High Demand encountered on ${model} (Key ${slot}) — halting burst immediately. Remaining chunks queued for next cycle.`,
+            })
+            break
+          } else if (outcome !== 'success') {
+            // Model error (429 / timeout) encountered on this slot:
             // Break slot loop so the outer orchestrator can evaluate health and failover
             break
           }
@@ -767,9 +777,16 @@ export class ChunkScanOrchestrator {
       else if (abortCtrl.signal.aborted || lower.includes('timeout')) outcome = 'timeout'
       else outcome = '503'
 
-      if (outcome === '503') slotState.errors503++
-      else if (outcome === '429') slotState.errors429++
-      else if (outcome === 'timeout') slotState.timeouts++
+      if (outcome === '503') {
+        slotState.errors503++
+        this.updateModelHealthFromLatency(model, latencyMs, '503')
+      } else if (outcome === '429') {
+        slotState.errors429++
+        this.updateModelHealthFromLatency(model, latencyMs, '429')
+      } else if (outcome === 'timeout') {
+        slotState.timeouts++
+        this.updateModelHealthFromLatency(model, latencyMs, 'timeout')
+      }
 
       if (chunk.attempts >= 3) {
         chunk.status = 'parked'
@@ -784,7 +801,7 @@ export class ChunkScanOrchestrator {
         })
       } else {
         // NO IMMEDIATE RETRY: mark as 'failed'. It will be retried in the NEXT
-        // burst cycle (after next successful 3.6 choke), prioritized first.
+        // burst cycle (after next successful choke), prioritized first.
         chunk.status = 'failed'
         this.log({
           timestamp: Date.now(),
@@ -794,7 +811,7 @@ export class ChunkScanOrchestrator {
           chunkIndex: chunk.index,
           outcome,
           latencyMs,
-          message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} on Key ${slot}. Re-queued for retry.`,
+          message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. Stopped and queued for retry in next burst cycle.`,
         })
       }
     } finally {
@@ -872,6 +889,13 @@ export class ChunkScanOrchestrator {
           })
           this.state.canaryActive = false
           return
+        } else {
+          this.log({
+            timestamp: Date.now(),
+            type: 'recovery',
+            model: ORCHESTRATOR_PRIMARY_MODEL,
+            message: `Primary 3.6 still in high demand / 503. Continuing canary 3.5 recovery watch...`,
+          })
         }
       }
 
