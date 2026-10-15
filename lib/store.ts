@@ -227,15 +227,34 @@ export function decrementModelUsage(model: string, apiKey: string): number {
   return (counters[key] as number) || 0
 }
 
-export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20) {
+export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20, force: boolean = false) {
   checkDailyReset()
-  const usage = getModelUsage(model, apiKey)
-  // FINAL DECISION: Only persist exhausted flag if setting quota is actually reached!
-  if (usage < rpdCap) {
-    return
-  }
   const counters = getCachedCounters()
-  counters[exhaustedKey(model, apiKey)] = { at: Date.now() }
+  const key = counterKey(model, apiKey)
+  const usage = typeof counters[key] === 'number' ? (counters[key] as number) : 0
+  if (force || usage >= rpdCap) {
+    counters[key] = Math.max(rpdCap, usage)
+    counters[exhaustedKey(model, apiKey)] = { at: Date.now() }
+    saveCounters(counters)
+  }
+}
+
+export function forceModelExhausted(model: string, apiKey?: string, rpdCap: number = 20) {
+  checkDailyReset()
+  const counters = getCachedCounters()
+  if (apiKey) {
+    const k = counterKey(model, apiKey)
+    const usage = typeof counters[k] === 'number' ? (counters[k] as number) : 0
+    counters[k] = Math.max(rpdCap, usage)
+    counters[exhaustedKey(model, apiKey)] = { at: Date.now() }
+  } else {
+    for (const rawKey of Object.keys(counters)) {
+      if (rawKey.startsWith(`${model}|`)) {
+        const usage = typeof counters[rawKey] === 'number' ? (counters[rawKey] as number) : 0
+        counters[rawKey] = Math.max(rpdCap, usage)
+      }
+    }
+  }
   saveCounters(counters)
 }
 

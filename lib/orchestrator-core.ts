@@ -17,11 +17,11 @@ import {
   ORCHESTRATOR_CHUNK_TIMEOUT_MS,
   ORCHESTRATOR_CHOKE_TIMEOUT_MS,
   ORCHESTRATOR_BURST_MAX,
-} from './models'
-import { getApiKeyN, incrementModelUsage } from './store'
+import { getApiKeyN, incrementModelUsage, forceModelExhausted } from './store'
 
 export interface ChunkQueueItem {
   index: number
+  segIndex: number
   status: 'pending' | 'assigned' | 'processing' | 'done' | 'failed' | 'parked'
   assignedKey?: number
   assignedModel?: string
@@ -47,6 +47,7 @@ export type ChunkExecutor = (
   model: string,
   timeoutMs: number,
   signal: AbortSignal,
+  segIndex: number,
 ) => Promise<{ ok: boolean; is503?: boolean; is429?: boolean; isTimeout?: boolean; error?: string }>
 
 export interface OrchestratorLogEvent {
@@ -72,6 +73,7 @@ export class ChunkScanOrchestrator {
   private lastAllModelsChokeTime = Date.now()
   private logs: OrchestratorLogEvent[] = []
   private chunkExecutor: ChunkExecutor | null = null
+  private droppedModelsToday = new Set<string>()
 
   private state: OrchestratorLiveState = this.createInitialState()
 
@@ -258,7 +260,7 @@ export class ChunkScanOrchestrator {
    */
   public prepareChunks(
     scanId: string,
-    chunks: number[] | { index: number; attempts?: number; lastError?: string }[],
+    chunks: number[] | { index: number; segIndex?: number; attempts?: number; lastError?: string }[],
   ) {
     this.activeScanId = scanId
     this.stopping = false
@@ -268,10 +270,12 @@ export class ChunkScanOrchestrator {
 
     this.chunkQueue = chunks.map((item) => {
       const idx = typeof item === 'number' ? item : item.index
-      const attempts = 0
+      const segIdx = typeof item === 'number' ? 0 : (item.segIndex ?? 0)
+      const attempts = typeof item === 'number' ? 0 : (item.attempts ?? 0)
       const lastError = typeof item === 'number' ? undefined : item.lastError
       return {
         index: idx,
+        segIndex: segIdx,
         status: 'pending' as const,
         attempts,
         lastError,
@@ -291,6 +295,34 @@ export class ChunkScanOrchestrator {
    * Evaluates latency: <3s = healthy, 3-15s = degrading, 15-60s = critical, >60s/503/hang = skip model.
    * Timeout 120s.
    */
+  public isModelDroppedToday(model: string): boolean {
+    return this.droppedModelsToday.has(model)
+  }
+
+  public dropModelForToday(model: string, reason?: string) {
+    if (this.droppedModelsToday.has(model)) return
+    this.droppedModelsToday.add(model)
+    const mh = this.state.models[model]
+    if (mh) {
+      mh.status = 'exhausted'
+      mh.effectiveParallelism = 0
+    }
+    this.state.healthyModels = this.state.healthyModels.filter((m) => m !== model)
+    this.state.lastUpdated = Date.now()
+
+    for (const apiKey of this.keyApiMap.values()) {
+      forceModelExhausted(model, apiKey, 20)
+    }
+
+    this.log({
+      timestamp: Date.now(),
+      type: 'failover',
+      model,
+      outcome: '429',
+      message: `[RPD EXHAUSTED] Model ${model} reached 429 Daily Quota. Model DROPPED for today — no further requests will be sent to ${model} today. Reason: ${reason ? reason.slice(0, 160) : 'Daily quota limit reached'}`,
+    })
+  }
+
   /**
    * Helper to sleep with interrupt check every 500ms
    */
@@ -315,6 +347,17 @@ export class ChunkScanOrchestrator {
    * - If 503 or error, strictly treated as FAIL (ok = false)
    */
   public async probeChoke(model: string, overrideKeySlot?: number): Promise<ChokeResult> {
+    if (this.isModelDroppedToday(model)) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        is503: false,
+        is429: true,
+        isTimeout: false,
+        error: `Model ${model} is dropped for today due to 429 RPD Daily Quota Exceeded.`,
+      }
+    }
+
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       if (overrideKeySlot) return s === overrideKeySlot
       return true
@@ -358,7 +401,7 @@ export class ChunkScanOrchestrator {
         model,
         contents: 'hy',
         config: {
-          maxOutputTokens: 500,
+          maxOutputTokens: 1000,
           temperature: 0,
         },
       })
@@ -369,18 +412,19 @@ export class ChunkScanOrchestrator {
       const finishReason = cand0?.finishReason
 
       let rawText = (response.text || '').trim()
-      if (!rawText && cand0?.content?.parts && Array.isArray(cand0.content.parts)) {
-        for (const p of cand0.content.parts as Array<{ text?: string }>) {
+      if (cand0?.content?.parts && Array.isArray(cand0.content.parts)) {
+        for (const p of cand0.content.parts as Array<{ text?: string; thought?: boolean }>) {
           if (p.text && p.text.trim()) {
-            rawText = p.text.trim()
-            break
+            if (!rawText || !p.thought) {
+              rawText = p.text.trim()
+            }
           }
         }
       }
 
-      // If server responded cleanly without throwing 503, but rawText is somehow empty
-      if (!rawText && (finishReason === 'STOP' || finishReason === 'MAX_TOKENS')) {
-        rawText = 'OK'
+      // If server responded cleanly with HTTP 200 without throwing 503, but rawText is still empty
+      if (!rawText) {
+        rawText = finishReason ? `Model responded (${finishReason})` : 'OK (Model acknowledged)'
       }
 
       const lowerText = rawText.toLowerCase()
@@ -397,8 +441,8 @@ export class ChunkScanOrchestrator {
         lowerText.includes('resource_exhausted') ||
         lowerText.includes('quota exceeded')
 
-      // Strict success criterion: NO 503 markers, NOT safety blocked
-      const ok = !textHas503 && finishReason !== 'SAFETY' && (rawText.length > 0 || finishReason === 'STOP' || finishReason === 'MAX_TOKENS')
+      // Strict success criterion: NO 503 markers, NOT safety blocked, candidate returned
+      const ok = !textHas503 && finishReason !== 'SAFETY' && (rawText.length > 0 || Boolean(cand0))
 
       if (ok) {
         this.updateModelHealthFromLatency(model, latencyMs, 'success')
@@ -409,7 +453,7 @@ export class ChunkScanOrchestrator {
           keySlot: chosenSlot,
           outcome: 'success',
           latencyMs,
-          message: `Choke ${model} on Key ${chosenSlot} SUCCEEDED in ${(latencyMs / 1000).toFixed(2)}s — Model reply: "${rawText}"`,
+          message: `Choke ${model} on Key ${chosenSlot} SUCCEEDED in ${(latencyMs / 1000).toFixed(2)}s — Model reply: "${rawText.slice(0, 80)}"`,
         })
 
         return {
@@ -422,10 +466,10 @@ export class ChunkScanOrchestrator {
         }
       }
 
-      // If text returned 503 or empty
+      // If text returned 503
       const failReason = textHas503
-        ? `Model returned 503/high demand text: "${rawText}"`
-        : `Model returned empty response (${finishReason || 'NO_TEXT'})`
+        ? `Model returned 503/high demand text: "${rawText.slice(0, 100)}"`
+        : `Model returned blocked response (${finishReason || 'SAFETY'})`
 
       this.updateModelHealthFromLatency(model, latencyMs, '503')
       const slotState = this.state.slots[chosenSlot]
@@ -504,6 +548,21 @@ export class ChunkScanOrchestrator {
       let outcome: '503' | '429' | 'timeout' = '503'
       if (is429) outcome = '429'
       else if (isTimeout) outcome = 'timeout'
+
+      const isRpd =
+        is429 &&
+        (lower.includes('generaterequestsperday') ||
+          lower.includes('generate_content_free_tier_requests') ||
+          lower.includes('perday') ||
+          lower.includes('per_day') ||
+          lower.includes('quota exceeded for metric') ||
+          /limit:\s*20/i.test(errDetail) ||
+          /retry in \d+h/i.test(errDetail) ||
+          /retry in \d+m/i.test(errDetail))
+
+      if (isRpd) {
+        this.dropModelForToday(model, errDetail)
+      }
 
       this.updateModelHealthFromLatency(model, latencyMs, outcome)
 
@@ -656,110 +715,150 @@ export class ChunkScanOrchestrator {
       // Probes gemini-3.6-flash with message "hy".
       // If 3.6 succeeds -> launch 10 burst requests immediately (<3s).
       // (3.5 1-min choke is OFF while 3.6 burst is running).
+      // If 3.6 is dropped (429 RPD), skip directly to 3.7.
       // ==============================================================
-      this.state.phase = 'choke_primary'
-      this.state.activeModel = ORCHESTRATOR_PRIMARY_MODEL
-      this.log({
-        timestamp: Date.now(),
-        type: 'choke',
-        model: ORCHESTRATOR_PRIMARY_MODEL,
-        message: `Phase [choke_primary]: Probing Primary model ${ORCHESTRATOR_PRIMARY_MODEL} with "hy"...`,
-      })
-
-      const primaryChoke = await this.probeChoke(ORCHESTRATOR_PRIMARY_MODEL)
-
-      if (primaryChoke.ok) {
-        this.state.phase = 'burst_primary'
+      let primaryChokeSuccess = false
+      if (this.isModelDroppedToday(ORCHESTRATOR_PRIMARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_PRIMARY_MODEL,
-          message: `Phase [burst_primary]: Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 10 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+          message: `Primary 3.6 is DROPPED for today (429 RPD Quota Exceeded). Skipping 3.6 directly to Secondary 3.7...`,
         })
-        await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 10)
-        continue
+      } else {
+        this.state.phase = 'choke_primary'
+        this.state.activeModel = ORCHESTRATOR_PRIMARY_MODEL
+        this.log({
+          timestamp: Date.now(),
+          type: 'choke',
+          model: ORCHESTRATOR_PRIMARY_MODEL,
+          message: `Phase [choke_primary]: Probing Primary model ${ORCHESTRATOR_PRIMARY_MODEL} with "hy"...`,
+        })
+
+        const primaryChoke = await this.probeChoke(ORCHESTRATOR_PRIMARY_MODEL)
+
+        if (primaryChoke.ok) {
+          primaryChokeSuccess = true
+          this.state.phase = 'burst_primary'
+          this.log({
+            timestamp: Date.now(),
+            type: 'info',
+            model: ORCHESTRATOR_PRIMARY_MODEL,
+            message: `Phase [burst_primary]: Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 10 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+          })
+          await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 10)
+          continue
+        } else {
+          this.log({
+            timestamp: Date.now(),
+            type: 'failover',
+            model: ORCHESTRATOR_PRIMARY_MODEL,
+            message: `Primary 3.6 choke failed (${primaryChoke.error || '503 High Demand'}). Immediately probing Secondary 3.7...`,
+          })
+        }
       }
 
       // ==============================================================
-      // STEP 3: SECONDARY 3.7 CHOKE PROBE (on 3.6 failure)
+      // STEP 3: SECONDARY 3.7 CHOKE PROBE (on 3.6 failure or dropped)
       // Probes gemini-3.7-flash with message "hy".
       // If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
       // (3.5 1-min choke is OFF while 3.7 burst is running).
+      // If 3.7 is dropped (429 RPD), skip directly to 3.8.
       // ==============================================================
-      this.log({
-        timestamp: Date.now(),
-        type: 'failover',
-        model: ORCHESTRATOR_PRIMARY_MODEL,
-        message: `Primary 3.6 choke failed (${primaryChoke.error || '503 High Demand'}). Immediately probing Secondary 3.7...`,
-      })
-
-      this.state.phase = 'choke_secondary'
-      this.state.activeModel = ORCHESTRATOR_SECONDARY_MODEL
-      this.log({
-        timestamp: Date.now(),
-        type: 'choke',
-        model: ORCHESTRATOR_SECONDARY_MODEL,
-        message: `Phase [choke_secondary]: Probing Secondary model ${ORCHESTRATOR_SECONDARY_MODEL} with "hy"...`,
-      })
-
-      const secChoke = await this.probeChoke(ORCHESTRATOR_SECONDARY_MODEL)
-
-      if (secChoke.ok) {
-        this.state.phase = 'burst_secondary'
+      let secChokeSuccess = false
+      if (this.isModelDroppedToday(ORCHESTRATOR_SECONDARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_SECONDARY_MODEL,
-          message: `Phase [burst_secondary]: Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+          message: `Secondary 3.7 is DROPPED for today (429 RPD Quota Exceeded). Skipping 3.7 directly to Tertiary 3.8...`,
         })
-        await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL, 4)
-        continue
+      } else {
+        this.state.phase = 'choke_secondary'
+        this.state.activeModel = ORCHESTRATOR_SECONDARY_MODEL
+        this.log({
+          timestamp: Date.now(),
+          type: 'choke',
+          model: ORCHESTRATOR_SECONDARY_MODEL,
+          message: `Phase [choke_secondary]: Probing Secondary model ${ORCHESTRATOR_SECONDARY_MODEL} with "hy"...`,
+        })
+
+        const secChoke = await this.probeChoke(ORCHESTRATOR_SECONDARY_MODEL)
+
+        if (secChoke.ok) {
+          secChokeSuccess = true
+          this.state.phase = 'burst_secondary'
+          this.log({
+            timestamp: Date.now(),
+            type: 'info',
+            model: ORCHESTRATOR_SECONDARY_MODEL,
+            message: `Phase [burst_secondary]: Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+          })
+          await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL, 4)
+          continue
+        } else {
+          this.log({
+            timestamp: Date.now(),
+            type: 'failover',
+            model: ORCHESTRATOR_SECONDARY_MODEL,
+            message: `Secondary 3.7 choke failed (${secChoke.error || '503 High Demand'}). Immediately probing Tertiary 3.8...`,
+          })
+        }
       }
 
       // ==============================================================
-      // STEP 4: TERTIARY 3.8 CHOKE PROBE (on 3.7 failure)
+      // STEP 4: TERTIARY 3.8 CHOKE PROBE (on 3.7 failure or dropped)
       // Probes gemini-3.8-flash with message "hy".
       // If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
       // (3.5 1-min choke is OFF while 3.8 burst is running).
       // ==============================================================
-      this.log({
-        timestamp: Date.now(),
-        type: 'failover',
-        model: ORCHESTRATOR_SECONDARY_MODEL,
-        message: `Secondary 3.7 choke failed with 503 (${secChoke.error || '503 High Demand'}). Immediately probing Tertiary 3.8...`,
-      })
-
-      this.state.phase = 'choke_tertiary'
-      this.state.activeModel = ORCHESTRATOR_TERTIARY_MODEL
-      this.log({
-        timestamp: Date.now(),
-        type: 'choke',
-        model: ORCHESTRATOR_TERTIARY_MODEL,
-        message: `Phase [choke_tertiary]: Probing Tertiary model ${ORCHESTRATOR_TERTIARY_MODEL} with "hy"...`,
-      })
-
-      const tertChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
-
-      if (tertChoke.ok) {
-        this.state.phase = 'burst_tertiary'
+      if (this.isModelDroppedToday(ORCHESTRATOR_TERTIARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_TERTIARY_MODEL,
-          message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+          message: `Tertiary 3.8 is DROPPED for today (429 RPD Quota Exceeded). All worker models exhausted.`,
         })
-        await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL, 4)
-        continue
+      } else {
+        this.state.phase = 'choke_tertiary'
+        this.state.activeModel = ORCHESTRATOR_TERTIARY_MODEL
+        this.log({
+          timestamp: Date.now(),
+          type: 'choke',
+          model: ORCHESTRATOR_TERTIARY_MODEL,
+          message: `Phase [choke_tertiary]: Probing Tertiary model ${ORCHESTRATOR_TERTIARY_MODEL} with "hy"...`,
+        })
+
+        const tertChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
+
+        if (tertChoke.ok) {
+          this.state.phase = 'burst_tertiary'
+          this.log({
+            timestamp: Date.now(),
+            type: 'info',
+            model: ORCHESTRATOR_TERTIARY_MODEL,
+            message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+          })
+          await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL, 4)
+          continue
+        }
       }
 
       // ==============================================================
-      // STEP 5: UNLIMITED WAIT (All 3.6, 3.7, 3.8 failed with 503)
+      // STEP 5: UNLIMITED WAIT (All available worker models failed with 503 or dropped)
       // Resumes 3.5 Flash 1-min choke loop.
       // ==============================================================
+      const allDropped =
+        this.isModelDroppedToday(ORCHESTRATOR_PRIMARY_MODEL) &&
+        this.isModelDroppedToday(ORCHESTRATOR_SECONDARY_MODEL) &&
+        this.isModelDroppedToday(ORCHESTRATOR_TERTIARY_MODEL)
+
       this.log({
         timestamp: Date.now(),
         type: 'warn',
-        message: `All worker models (3.6, 3.7, 3.8) are in 503 / High Demand. Entering UNLIMITED WAIT — resuming 3.5 Flash 1-min choke loop.`,
+        message: allDropped
+          ? `All worker models (3.6, 3.7, 3.8) are DROPPED for today (429 RPD Daily Quota Exceeded). Entering UNLIMITED WAIT until daily reset.`
+          : `All worker models (3.6, 3.7, 3.8) are in 503 / High Demand. Entering UNLIMITED WAIT — resuming 3.5 Flash 1-min choke loop.`,
       })
 
       this.state.phase = 'recovery_watch'
@@ -916,7 +1015,7 @@ export class ChunkScanOrchestrator {
       model,
       keySlot: slot,
       chunkIndex: chunk.index,
-      message: `Chunk #${chunk.index} assigned to Key ${slot} on ${model} (Attempt ${chunk.attempts}).`,
+      message: `Chunk #${chunk.index} (Minute ${(chunk.segIndex ?? 0) + 1}) assigned to Key ${slot} on ${model} (Attempt ${chunk.attempts}).`,
     })
 
     const abortCtrl = new AbortController()
@@ -937,6 +1036,7 @@ export class ChunkScanOrchestrator {
           model,
           ORCHESTRATOR_CHUNK_TIMEOUT_MS,
           abortCtrl.signal,
+          chunk.segIndex ?? 0,
         )
       } else {
         // Default simulated work / live call placeholder
@@ -957,7 +1057,7 @@ export class ChunkScanOrchestrator {
           chunkIndex: chunk.index,
           outcome: 'success',
           latencyMs: Date.now() - startTime,
-          message: `Chunk #${chunk.index} completed successfully on Key ${slot} (${model}) in ${((Date.now() - startTime) / 1000).toFixed(1)}s.`,
+          message: `Chunk #${chunk.index} (Minute ${(chunk.segIndex ?? 0) + 1}) completed successfully on Key ${slot} (${model}) in ${((Date.now() - startTime) / 1000).toFixed(1)}s.`,
         })
       } else {
         if (result.is429) outcome = '429'

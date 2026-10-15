@@ -925,9 +925,11 @@ export function classifyError(
     ) {
       kind = 'rate'
     } else if (
-      (qIdLower.includes('perday') || qIdLower.includes('per_day')) &&
-      !qIdLower.includes('perminute') &&
-      !qIdLower.includes('per_minute')
+      ((qIdLower.includes('perday') || qIdLower.includes('per_day') || lower.includes('generaterequestsperday') || lower.includes('generate_content_free_tier_requests') || lower.includes('quota exceeded for metric')) &&
+        !qIdLower.includes('perminute') &&
+        !qIdLower.includes('per_minute')) ||
+      (googleRetryDelayMs && googleRetryDelayMs > 1800_000) ||
+      /retry in \d+h/i.test(lower)
     ) {
       kind = 'rpd'
     } else {

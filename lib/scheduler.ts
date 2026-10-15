@@ -30,7 +30,7 @@ import {
   cleanseStartupQuotas,
 } from './store'
 import { chunkPath, cleanupClips, extractClipPrecise, extractSegment, sanitizeVideoMute, segmentPath } from './ffmpeg'
-import { chunkOverlapsSegRange, segMovieRange, segHasMinuteList, formatMinuteList } from './segment-range'
+import { chunkOverlapsSegRange } from './segment-range'
 import {
   ensureIndex,
   createIndexTask,
@@ -1301,14 +1301,14 @@ class Scheduler {
     for (let pass = 0; pass < MAX_PASSES; pass++) {
       job.earlyStopRevived = false
 
-      // PER-MINUTE CHUNK PASSES: within a minute the three dedicated CHUNK models
-      // map chunks while the global verify workers check candidates in parallel.
-      for (const seg of segments) {
-        if (job.stopping) break
-        // MINUTE SELECTION: unselected minutes are skipped entirely (quota saver).
-        if (seg.selected === false) continue
+      // MULTI-MINUTE CHUNK PASSES:
+      // The OrchestratorCore scans all selected minute segments unifiedly so that when
+      // a burst of 10 requests (or 4 requests on 3.7/3.8) is available, it pulls pending chunks
+      // across all remaining minutes rather than being bottlenecked to just 1 minute!
+      const activeSegments = segments.filter((s) => s.selected !== false)
 
-        // Revive any chunks that do not have real result (match / no_match) and are not legitimately cancelled
+      // Revive any chunks that do not have real result (match / no_match) and are not legitimately cancelled
+      for (const seg of activeSegments) {
         for (const c of seg.chunks) {
           const inRange = chunkOverlapsSegRange(scan, seg, c.index)
           const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
@@ -1316,67 +1316,39 @@ class Scheduler {
             c.status = 'pending'
           }
         }
+      }
 
-        const pending = seg.chunks.filter((c) => c.status === 'pending')
-        if (pending.length === 0) continue
+      const totalPendingChunks = activeSegments.reduce(
+        (sum, s) => sum + s.chunks.filter((c) => c.status === 'pending').length,
+        0,
+      )
 
-        scan.currentShortSegment = seg.index
-        job.seg = seg
-        // Mirror: scan.chunks IS this segment's chunks array (same reference),
-        // so the existing worker code + UI keep working unchanged.
-        scan.chunks = seg.chunks
+      if (totalPendingChunks > 0 && !job.stopping) {
         if (!job.stopping) scan.status = 'scanning'
-        seg.status = 'scanning'
-        // CONFIDENCE ORDER (TwelveLabs): sabse zyada confident chunks PEHLE scan
-        // hote hain — matches jaldi milte hain, early-stop jaldi fire hota hai.
-        job.queue = this.orderByConfidence(seg, pending.map((c) => c.index))
-        const hasConf = Boolean(seg.chunkConfidence && Object.keys(seg.chunkConfidence).length > 0)
-        this.mark(job)
-
-        if (multi) {
-          const r = segMovieRange(scan, seg)
-          const rangeNote = segHasMinuteList(seg)
-            ? ` (movie minutes [${formatMinuteList(seg.movieMinutes!)}] only — ${seg.movieMinutes!.length} listed, gap chunks skipped)`
-            : r.custom
-              ? ` (movie range ${ts(r.start)}–${ts(r.end)} only — baaki chunks skipped)`
-              : ''
-          addLog(scan, 'info', `Minute ${seg.index + 1}/${segments.length}: scanning short ${ts(seg.start)}–${ts(seg.end)} against ${pending.length} pending movie chunk(s)${rangeNote}${hasConf ? ' — confidence order high→low' : ''}`)
-        }
         addLog(
           scan,
           'info',
-          `Pipeline parallelism ON: chunk models (${CHUNK_MODEL_POOL.map((m) => m.id).join(', ')}) map chunks while verify models check candidates in the background — verification ke liye agla minute WAIT NAHI karta`,
+          `Chunk scan starting across ${activeSegments.length} selected minute segment(s) (${totalPendingChunks} pending chunks total) — Orchestrator handles choke→burst cycle across all minutes without per-minute bottleneck.`,
         )
         this.mark(job)
 
-        // NEXT-MINUTE PREP (fire-and-forget): while THIS minute scans, the
-        // next selected minute's segment upload + chunk cutting run in the
-        // background so the next pass starts instantly.
-        this.prepareNextSegment(job, segments, seg.index)
-
         // MATCHTOOL CHUNK SCAN ORCHESTRATOR: Choke (3.5 -> 3.6 -> 3.7 -> 3.8) -> Burst (10/4/4 within 3s) -> Unlimited Recovery Watch
-        await this.runOrchestratorChunkScan(job, seg)
+        await this.runOrchestratorChunkScan(job, activeSegments)
         // Catch any candidates merged by the very last chunk.
         this.enqueueNewGroups(job)
+      }
 
-        if (job.stopping) break
+      if (job.stopping) break
 
-        // Clean up any stray scanning status
+      // Clean up any stray scanning status
+      for (const seg of activeSegments) {
         for (const c of seg.chunks) {
           if (c.status === 'scanning') c.status = 'pending'
         }
+      }
 
-        // Only stop if ALL models across ALL lanes are genuinely exhausted for today
-        const anyActiveModel = job.lanes.some((l) =>
-          CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(l.apiKey, m.id, m.rpd))
-        )
-        if (!anyActiveModel) {
-          addLog(scan, 'error', `All models across all ${job.lanes.length} API keys are exhausted for today — cannot advance to next minute.`)
-          break
-        }
-
-        // Minute ke saare chunks settle — turant AGLE minute par badho.
-        // Is minute ki bachi verification background me poori hoti rahegi.
+      // Update segment statuses
+      for (const seg of activeSegments) {
         const segGroups = (scan.candidateGroups || []).filter((g) => g.shortStart < seg.end && g.shortEnd > seg.start)
         const unresolved =
           scan.verifierEnabled === false
@@ -1384,16 +1356,21 @@ class Scheduler {
             : segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
         const hasUnfinishedChunks = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
         seg.status = hasUnfinishedChunks ? 'pending' : (unresolved.length > 0 ? 'verifying' : 'done')
-        if (multi) {
-          addLog(
-            scan,
-            'success',
-            unresolved.length > 0
-              ? `Minute ${seg.index + 1}/${segments.length}: chunk scan complete — ${unresolved.length} group(s) background me verify ho rahe hain, agla minute abhi start ho raha hai (no wait)`
-              : `Minute ${seg.index + 1}/${segments.length} complete — mapped + verified against the whole movie`,
-          )
-        }
-        this.mark(job)
+      }
+      this.mark(job)
+
+      // Only stop if ALL models across ALL lanes are genuinely exhausted for today
+      const anyActiveModel = job.lanes.some((l) =>
+        CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(l.apiKey, m.id, m.rpd))
+      )
+      if (!anyActiveModel) {
+        addLog(scan, 'error', `All models across all ${job.lanes.length} API keys are exhausted for today — cannot continue chunk scan.`)
+        break
+      }
+
+      const anyRemainingPending = activeSegments.some((s) => s.chunks.some((c) => c.status === 'pending'))
+      if (!anyRemainingPending) {
+        break
       }
 
       // All minutes' chunk phases done (or quota-blocked) — let the verify
@@ -1488,12 +1465,12 @@ class Scheduler {
 
   /**
    * MATCHTOOL ORCHESTRATOR CHUNK SCANNER (choke -> burst -> failover -> recovery)
-   * Exclusively handles resumed scans using OrchestratorCore (lib/orchestrator-core.ts).
-   * Legacy laneWorker chunk loop is completely bypassed on the resume flow.
+   * Handles chunk scanning across all active minute segments unifiedly using OrchestratorCore (lib/orchestrator-core.ts).
+   * Automatically queues chunks from subsequent minutes so full 10-burst (or 4-burst on 3.7/3.8) parallelism is utilized.
    */
-  private async runOrchestratorChunkScan(job: Job, seg: ShortSegmentState) {
+  private async runOrchestratorChunkScan(job: Job, targetSegments: ShortSegmentState[]) {
     const { scan } = job
-    // Reset orchestrator state cleanly for this minute segment
+    // Reset orchestrator state cleanly
     globalOrchestrator.reset()
 
     // 1. Register active worker keys into orchestrator (slots 2..13, 15, 16)
@@ -1501,43 +1478,49 @@ class Scheduler {
       globalOrchestrator.registerKey(lane.idx, lane.apiKey)
     }
 
-    // 2. Load all unfinished chunks for THIS minute segment (must be genuine match or no_match to be considered done)
-    for (const c of seg.chunks) {
-      const isFinished = c.status === 'match' || c.status === 'no_match'
-      if (!isFinished && c.status !== 'cancelled') {
-        c.status = 'pending'
+    // 2. Load all unfinished chunks across ALL target segments
+    const allPendingChunks: { index: number; segIndex: number; attempts: number; lastError?: string }[] = []
+
+    for (const seg of targetSegments) {
+      for (const c of seg.chunks) {
+        const isFinished = c.status === 'match' || c.status === 'no_match'
+        if (!isFinished && c.status !== 'cancelled' && !c.skippedEarlyStop) {
+          c.status = 'pending'
+          allPendingChunks.push({
+            index: c.index,
+            segIndex: seg.index,
+            attempts: c.requestCount || c.attempts || 0,
+            lastError: c.lastError,
+          })
+        }
       }
     }
 
-    const pendingOrFailed = seg.chunks
-      .filter((c) => c.status === 'pending')
-      .map((c) => ({
-        index: c.index,
-        attempts: c.requestCount || c.attempts || 0,
-        lastError: c.lastError,
-      }))
-
-    if (pendingOrFailed.length === 0) {
-      addLog(scan, 'info', `[choke_primary] Minute ${seg.index + 1}: no pending or failed chunks left to scan.`)
+    if (allPendingChunks.length === 0) {
+      addLog(scan, 'info', `[choke_primary] All chunks across all selected minutes are already complete.`)
       return
     }
 
     addLog(
       scan,
       'info',
-      `[choke_primary] Initializing OrchestratorCore for Minute ${seg.index + 1} (${pendingOrFailed.length} chunk(s) pending/failed across ${job.lanes.length} worker keys) — starting choke→burst cycle`,
+      `[choke_primary] Initializing OrchestratorCore across ${targetSegments.length} minute segment(s) (${allPendingChunks.length} chunk(s) pending/failed across ${job.lanes.length} worker keys) — starting choke→burst cycle`,
     )
 
     // Load chunks into OrchestratorCore
-    globalOrchestrator.prepareChunks(scan.id, pendingOrFailed)
+    globalOrchestrator.prepareChunks(scan.id, allPendingChunks)
 
-    // PRE-WARMING PIPELINE (Zero wait): Pre-upload short minute segment across all keys
+    // PRE-WARMING PIPELINE (Zero wait): Pre-upload short minute segments across all keys
     // and pre-cut pending chunk files in the background so when choke succeeds,
     // burst requests fire with ZERO wait!
     for (const lane of job.lanes) {
-      void this.ensureSegmentUri(job, lane, seg).catch(() => {})
+      for (const seg of targetSegments) {
+        if (seg.chunks.some((c) => c.status === 'pending')) {
+          void this.ensureSegmentUri(job, lane, seg).catch(() => {})
+        }
+      }
     }
-    for (const item of pendingOrFailed) {
+    for (const item of allPendingChunks) {
       void this.ensureChunkFile(scan, item.index).catch(() => {})
     }
 
@@ -1553,17 +1536,25 @@ class Scheduler {
             : event.outcome === 'success'
               ? 'success'
               : 'info'
-      // Log formatted message so the phase ("choke_primary" / "choke_secondary" / "burst_primary") is clearly visible in scan logs
       addLog(scan, level, `[${state.phase}] ${event.message}`)
       job.dirty = true
     })
 
     // Setup chunk executor
     globalOrchestrator.setChunkExecutor(
-      async (chunkIndex, keySlot, apiKey, model, timeoutMs, signal) => {
+      async (chunkIndex, keySlot, apiKey, model, timeoutMs, signal, segIndex) => {
         if (job.stopping) {
           return { ok: false, isTimeout: true, error: 'Scan stopped by user' }
         }
+
+        const seg = targetSegments.find((s) => s.index === segIndex) || scan.shortSegments?.[segIndex] || job.seg
+        if (!seg) {
+          return { ok: false, error: `Minute segment ${segIndex} not found` }
+        }
+
+        scan.currentShortSegment = seg.index
+        job.seg = seg
+        scan.chunks = seg.chunks
 
         const lane = job.lanes.find((l) => l.idx === keySlot) || {
           idx: keySlot,
@@ -1590,13 +1581,13 @@ class Scheduler {
           }
 
         try {
-          const c = scan.chunks[chunkIndex]
+          const c = seg.chunks[chunkIndex] || scan.chunks[chunkIndex]
           if (c && c.status !== 'match' && c.status !== 'no_match') {
             c.status = 'pending'
           }
-          await this.processChunk(job, lane, modelSpec, chunkIndex)
+          await this.processChunk(job, lane, modelSpec, chunkIndex, seg)
 
-          const finishedChunk = scan.chunks[chunkIndex]
+          const finishedChunk = seg.chunks[chunkIndex] || scan.chunks[chunkIndex]
           const isSuccess = finishedChunk && (finishedChunk.status === 'match' || finishedChunk.status === 'no_match')
           if (!isSuccess) {
             const lastErr = finishedChunk?.lastError || 'Chunk scan did not complete with match or no_match'
@@ -1626,11 +1617,23 @@ class Scheduler {
             }
           }
 
+          // Check if this minute segment has completed all its chunks
+          const hasUnfinished = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
+          if (!hasUnfinished && seg.status !== 'done') {
+            const segGroups = (scan.candidateGroups || []).filter((g) => g.shortStart < seg.end && g.shortEnd > seg.start)
+            const unresolved =
+              scan.verifierEnabled === false
+                ? []
+                : segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
+            seg.status = unresolved.length > 0 ? 'verifying' : 'done'
+            addLog(scan, 'success', `Minute ${seg.index + 1}/${targetSegments.length} chunk scan complete — candidates are verifying in background.`)
+          }
+
           // Catch any candidates merged by this chunk
           this.enqueueNewGroups(job)
           return { ok: true }
         } catch (err: unknown) {
-          const c = scan.chunks[chunkIndex]
+          const c = seg.chunks[chunkIndex] || scan.chunks[chunkIndex]
           if (c && c.status !== 'match' && c.status !== 'no_match') {
             c.status = 'pending'
           }
@@ -3180,15 +3183,15 @@ class Scheduler {
   }
 
   /** Process a single chunk on a specified key lane and model */
-  private async processChunk(job: Job, lane: KeyLane, m: ModelSpec, chunkIndex: number) {
+  private async processChunk(job: Job, lane: KeyLane, m: ModelSpec, chunkIndex: number, segOverride?: ShortSegmentState) {
     const { scan } = job
     const st = this.modelState(job, lane, m)
 
-    const chunk = scan.chunks[chunkIndex]
+    const seg = segOverride || job.seg
+    if (!seg) return
+    const chunk = seg.chunks[chunkIndex] || scan.chunks[chunkIndex]
     if (!chunk || chunk.status !== 'pending') return
-      const seg = job.seg
-      if (!seg) return
-      const minutePrefix = (scan.shortSegments?.length ?? 0) > 1 ? `Minute ${seg.index + 1} · ` : ''
+    const minutePrefix = (scan.shortSegments?.length ?? 0) > 1 ? `Minute ${seg.index + 1} · ` : ''
       job.inFlight.add(chunkIndex)
       chunk.status = 'scanning'
       chunk.model = m.id
@@ -3614,36 +3617,23 @@ class Scheduler {
               )
               throw reqErr
             } else if (re.kind === 'rpd') {
-              // Daily Quota: ONLY if model actually reached configured RPD limit (e.g. 20 RPD)
-              const used = getModelUsage(m.id, lane.apiKey)
-              if (used >= (m.rpd || 20)) {
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd || 20)
-                setModelExhausted(m.id, lane.apiKey, m.rpd || 20)
-                st.state = 'exhausted'
-                this.mark(job)
-                addLog(
-                  scan,
-                  'warn',
-                  `${minutePrefix}Chunk ${chunkIndex}: Daily limit reached (${used}/${m.rpd || 20} RPD) on ${displayModelName(m.id)} (key ${lane.idx}) — model exhausted for today; chunk re-queued for another key!`,
-                )
-                throw reqErr
-              } else {
-                // If not yet reached 20 RPD, do NOT mark daily exhausted! Give 1-min cooldown and hand chunk to another model!
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                const cooldownMs = 60_000
-                globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, cooldownMs, 0)
-                job.cooldownUntil[rk] = Date.now() + cooldownMs
-                st.state = 'cooling'
-                st.cooldownUntil = Date.now() + cooldownMs
-                this.mark(job)
-                addLog(
-                  scan,
-                  'warn',
-                  `${minutePrefix}Chunk ${chunkIndex}: Rate limit on ${displayModelName(m.id)} (key ${lane.idx}, used ${used}/${m.rpd || 20} RPD) — giving 1 min cooldown; handing chunk to another model!`,
-                )
-                throw reqErr
-              }
+              // Daily Quota (RPD): Google confirmed daily requests exceeded (e.g. limit: 20 reached).
+              // Drop this model for today and re-queue the chunk back to pending queue immediately!
+              globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
+              globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd || 20)
+              setModelExhausted(m.id, lane.apiKey, m.rpd || 20, true)
+              st.state = 'exhausted'
+              globalOrchestrator.dropModelForToday(m.id, reqErr instanceof Error ? reqErr.message : String(reqErr))
+              chunk.status = 'pending'
+              chunk.assignedKey = undefined
+              chunk.assignedModel = undefined
+              this.mark(job)
+              addLog(
+                scan,
+                'warn',
+                `${minutePrefix}Chunk ${chunkIndex}: 429 Daily Quota Exceeded on ${displayModelName(m.id)} (key ${lane.idx}) — model dropped for today; chunk returned to pending queue!`,
+              )
+              throw reqErr
             } else if (re.kind === 'rate') {
               addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 429 rate limit — no retry, queued for next burst cycle`)
               const errTokenUsage429: ChunkTokenUsage = {
