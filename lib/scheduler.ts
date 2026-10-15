@@ -3203,7 +3203,7 @@ class Scheduler {
           globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
           chunk.status = 'pending'
           this.mark(job)
-          return
+          throw new Error('Scan stopped by user')
         }
 
         const [shortUri, uploaded] = await uploadsP
@@ -3253,11 +3253,6 @@ class Scheduler {
           )
         }
 
-        let rateRetries = 0
-        const maxRateRetries = 2
-        let overloadedRetries = 0
-        const maxOverloadedRetries = 3
-        const overloadedDelays = [5_000, 15_000, 45_000]
         let lastTokenUsage: ChunkTokenUsage | undefined
 
         while (true) {
@@ -3265,7 +3260,7 @@ class Scheduler {
             globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
             chunk.status = 'pending'
             this.mark(job)
-            return
+            throw new Error('Scan stopped by user')
           }
 
           try {
@@ -3425,50 +3420,31 @@ class Scheduler {
               this.mark(job)
               throw reqErr
             } else if (re.kind === 'overloaded') {
-              overloadedRetries++
               // Count each 503 high-demand attempt against this key & model quota
               incrementModelUsage(m.id, lane.apiKey)
-              if (overloadedRetries <= maxOverloadedRetries) {
-                const baseDelay = overloadedDelays[overloadedRetries - 1]
-                const jitterMs = Math.round(Math.random() * 2000)
-                const waitMs = baseDelay + jitterMs
-
-                // Log exactly "503 overloaded" (not "quota error") per model so identical lines aggregate into "(x10)"
-                addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 503 overloaded`)
-                const errTokenUsage503: ChunkTokenUsage = {
-                  shortVideoTokens: Math.round(segDuration * currentEmaRate),
-                  chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
-                  promptTokens: Math.round(promptChars / 4),
-                  outputTokens: 0,
-                  totalTokens: Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4),
-                  shortDurationSec: Number(segDuration.toFixed(1)),
-                  chunkDurationSec: Number(movieChunkDuration.toFixed(1)),
-                  ratePerSec: Math.round(currentEmaRate),
-                  isGoogleVerified: false,
-                  isError: true,
-                  errorMessage: `503 Overloaded (Attempt ${overloadedRetries}/${maxOverloadedRetries})`,
-                }
-                this.recordChunkOutput(
-                  chunk,
-                  m.id,
-                  `[503 OVERLOADED ERROR]\nModel: ${m.id} (Key ${lane.idx})\nStatus: Model experiencing high demand\nBackoff: ${(waitMs / 1000).toFixed(1)}s (Attempt ${overloadedRetries}/${maxOverloadedRetries})\nMessage: ${reqErr instanceof Error ? reqErr.message : String(reqErr)}`,
-                  errTokenUsage503,
-                  'error',
-                  reqErr instanceof Error ? reqErr.message : String(reqErr),
-                )
-                this.mark(job)
-
-                await this.stoppableSleep(job, waitMs)
-                if (job.stopping) {
-                  globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                  chunk.status = 'pending'
-                  this.mark(job)
-                  return
-                }
-                continue
+              addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 503 overloaded — no retry, queued for next burst cycle`)
+              const errTokenUsage503: ChunkTokenUsage = {
+                shortVideoTokens: Math.round(segDuration * currentEmaRate),
+                chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
+                promptTokens: Math.round(promptChars / 4),
+                outputTokens: 0,
+                totalTokens: Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4),
+                shortDurationSec: Number(segDuration.toFixed(1)),
+                chunkDurationSec: Number(movieChunkDuration.toFixed(1)),
+                ratePerSec: Math.round(currentEmaRate),
+                isGoogleVerified: false,
+                isError: true,
+                errorMessage: '503 Overloaded (no retry, queued for next burst cycle)',
               }
-
-              // Only switch key/model on the 4th failure
+              this.recordChunkOutput(
+                chunk,
+                m.id,
+                `[503 OVERLOADED ERROR]\nModel: ${m.id} (Key ${lane.idx})\nStatus: Model experiencing high demand — no retry, queued for next burst cycle\nMessage: ${reqErr instanceof Error ? reqErr.message : String(reqErr)}`,
+                errTokenUsage503,
+                'error',
+                reqErr instanceof Error ? reqErr.message : String(reqErr),
+              )
+              this.mark(job)
               globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
               throw reqErr
             } else if (isPolicyBlocked && !chunk.policyRetried) {
@@ -3612,30 +3588,7 @@ class Scheduler {
                 throw reqErr
               }
             } else if (re.kind === 'rate') {
-
-              rateRetries++
-              if (rateRetries > maxRateRetries) {
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                throw reqErr
-              }
-              const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 60_000)
-
-              // DYNAMIC COOLDOWN WITH EXCLUSIVE PRIORITY RETRY LOCK (Strict 2-minute max cap)
-              const cooldownMs = Math.min(120_000, effectiveCooldownMs)
-              const coolUntil = Date.now() + cooldownMs
-              job.cooldownUntil[rk] = coolUntil
-              globalGeminiCoordinator.reportChunkRateLimit(lane.apiKey, m.id, chunkLockId, cooldownMs)
-
-              st.state = 'cooling'
-              st.cooldownUntil = coolUntil
-              this.mark(job)
-
-              const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s safety buffer)` : ''
-              addLog(
-                scan,
-                'warn',
-                `${minutePrefix}Chunk ${chunkIndex}: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx})${googleNote} — giving ${(cooldownMs / 1000).toFixed(1)}s lock. Priority Lock held; will send first when lock expires (attempt ${rateRetries}/${maxRateRetries}).`,
-              )
+              addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 429 rate limit — no retry, queued for next burst cycle`)
               const errTokenUsage429: ChunkTokenUsage = {
                 shortVideoTokens: Math.round(segDuration * currentEmaRate),
                 chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
@@ -3647,39 +3600,19 @@ class Scheduler {
                 ratePerSec: Math.round(currentEmaRate),
                 isGoogleVerified: false,
                 isError: true,
-                errorMessage: `429 Rate Limit (Attempt ${rateRetries}/${maxRateRetries} — ${(cooldownMs / 1000).toFixed(1)}s lock)`,
+                errorMessage: '429 Rate Limit (no retry, queued for next burst cycle)',
               }
               this.recordChunkOutput(
                 chunk,
                 m.id,
-                `[429 RATE LIMIT EXCEEDED]\nModel: ${m.id} (Key ${lane.idx})\nStatus: Quota exceeded / high demand spike\nWait Duration: ${(cooldownMs / 1000).toFixed(1)}s lock (Attempt ${rateRetries}/${maxRateRetries})\nMessage: ${reqErr instanceof Error ? reqErr.message : String(reqErr)}`,
+                `[429 RATE LIMIT EXCEEDED]\nModel: ${m.id} (Key ${lane.idx})\nStatus: 429 rate limit — no retry, queued for next burst cycle\nMessage: ${reqErr instanceof Error ? reqErr.message : String(reqErr)}`,
                 errTokenUsage429,
                 'error',
                 reqErr instanceof Error ? reqErr.message : String(reqErr),
               )
-
-              const waitMs = coolUntil - Date.now()
-              if (waitMs > 0) {
-                await this.stoppableSleep(job, waitMs)
-              }
-
-              if (job.stopping) {
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                chunk.status = 'pending'
-                this.mark(job)
-                return
-              }
-
-              st.cooldownUntil = null
-              st.state = 'active'
               this.mark(job)
-
-              addLog(
-                scan,
-                'info',
-                `${minutePrefix}Chunk ${chunkIndex}: ${(cooldownMs / 1000).toFixed(1)}s lock ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending priority retry now!`,
-              )
-              continue
+              globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
+              throw reqErr
             } else {
               globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
               throw reqErr
