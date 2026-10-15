@@ -358,14 +358,31 @@ export class ChunkScanOrchestrator {
         model,
         contents: 'hy',
         config: {
-          maxOutputTokens: 30,
+          maxOutputTokens: 500,
           temperature: 0,
         },
       })
 
       clearTimeout(timeoutHandle)
       const latencyMs = Date.now() - start
-      const rawText = (response.text || '').trim()
+      const cand0 = response.candidates?.[0]
+      const finishReason = cand0?.finishReason
+
+      let rawText = (response.text || '').trim()
+      if (!rawText && cand0?.content?.parts && Array.isArray(cand0.content.parts)) {
+        for (const p of cand0.content.parts as Array<{ text?: string }>) {
+          if (p.text && p.text.trim()) {
+            rawText = p.text.trim()
+            break
+          }
+        }
+      }
+
+      // If server responded cleanly without throwing 503, but rawText is somehow empty
+      if (!rawText && (finishReason === 'STOP' || finishReason === 'MAX_TOKENS')) {
+        rawText = 'OK'
+      }
+
       const lowerText = rawText.toLowerCase()
 
       // Check if text returned by the model contains 503 / overload / high demand indications
@@ -380,12 +397,8 @@ export class ChunkScanOrchestrator {
         lowerText.includes('resource_exhausted') ||
         lowerText.includes('quota exceeded')
 
-      // Check candidate finishReason if present
-      const cand0 = response.candidates?.[0]
-      const finishReason = cand0?.finishReason
-
-      // Strict success criterion: NO 503 markers, NOT empty text
-      const ok = !textHas503 && rawText.length > 0 && finishReason !== 'SAFETY'
+      // Strict success criterion: NO 503 markers, NOT safety blocked
+      const ok = !textHas503 && finishReason !== 'SAFETY' && (rawText.length > 0 || finishReason === 'STOP' || finishReason === 'MAX_TOKENS')
 
       if (ok) {
         this.updateModelHealthFromLatency(model, latencyMs, 'success')
