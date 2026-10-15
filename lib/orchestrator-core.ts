@@ -597,6 +597,26 @@ export class ChunkScanOrchestrator {
     const health = this.state.models[model]
     const maxParallel = health ? health.effectiveParallelism : 4
 
+    // NEW BURST CYCLE: reset 'failed' chunks back to 'pending' so they are
+    // retried FIRST in this cycle (getNextChunkForAssignment prioritizes retries).
+    // Failed chunks from the previous cycle wait for this new choke→burst cycle.
+    let retriedCount = 0
+    for (const c of this.chunkQueue) {
+      if (c.status === 'failed') {
+        c.status = 'pending'
+        retriedCount++
+      }
+    }
+    if (retriedCount > 0) {
+      this.log({
+        timestamp: Date.now(),
+        type: 'info',
+        model,
+        message: `New burst cycle: ${retriedCount} failed chunk(s) re-queued for retry (prioritized first).`,
+      })
+      this.refreshQueueCounts()
+    }
+
     // Respect 60s minimum interval between burst batches on same model to avoid 429 wall
     const elapsedSinceLastBatch = Date.now() - this.lastBatchTime
     if (elapsedSinceLastBatch < 60_000 && this.lastBatchTime > 0) {
@@ -763,8 +783,9 @@ export class ChunkScanOrchestrator {
           message: `Chunk #${chunk.index} failed 3 times — parked to continue remaining scan without blocking.`,
         })
       } else {
-        // Return chunk to front of queue as pending for retry
-        chunk.status = 'pending'
+        // NO IMMEDIATE RETRY: mark as 'failed'. It will be retried in the NEXT
+        // burst cycle (after next successful 3.6 choke), prioritized first.
+        chunk.status = 'failed'
         this.log({
           timestamp: Date.now(),
           type: 'chunk',
