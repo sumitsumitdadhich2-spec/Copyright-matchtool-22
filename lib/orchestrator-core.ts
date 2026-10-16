@@ -75,6 +75,10 @@ export class ChunkScanOrchestrator {
   private logs: OrchestratorLogEvent[] = []
   private chunkExecutor: ChunkExecutor | null = null
   private droppedModelsToday = new Set<string>()
+  /** Per-(key, model) cooldown timestamp (1 min TPM cooldown from request dispatch or 503) */
+  private keyModelCooldown = new Map<string, number>()
+  /** Per-model cooldown timestamp (1 min cooldown when burst encounters 503 high demand) */
+  private modelCooldownUntil = new Map<string, number>()
 
   private state: OrchestratorLiveState = this.createInitialState()
 
@@ -328,6 +332,79 @@ export class ChunkScanOrchestrator {
     })
   }
 
+  public getKeyModelCooldown(slot: number, model: string): number {
+    return this.keyModelCooldown.get(`${slot}:${model}`) || 0
+  }
+
+  public setKeyModelCooldown(slot: number, model: string, durationMs: number = 60_000) {
+    const until = Date.now() + durationMs
+    const current = this.keyModelCooldown.get(`${slot}:${model}`) || 0
+    if (until > current) {
+      this.keyModelCooldown.set(`${slot}:${model}`, until)
+    }
+  }
+
+  public isKeyModelInCooldown(slot: number, model: string): boolean {
+    return (this.keyModelCooldown.get(`${slot}:${model}`) || 0) > Date.now()
+  }
+
+  public setModelCooldown(model: string, durationMs: number = 60_000) {
+    const until = Date.now() + durationMs
+    this.modelCooldownUntil.set(model, until)
+    const mh = this.state.models[model]
+    if (mh && mh.status !== 'exhausted') {
+      mh.status = 'stopped'
+      mh.effectiveParallelism = 0
+    }
+  }
+
+  public isModelInCooldown(model: string): boolean {
+    return (this.modelCooldownUntil.get(model) || 0) > Date.now()
+  }
+
+  public clearModelCooldown(model: string) {
+    this.modelCooldownUntil.delete(model)
+  }
+
+  /**
+   * Helper to inspect 429 error and determine if it's Daily Quota (RPD) vs Transient TPM/RPM.
+   * If true: daily quota is exhausted (limit: 20 per day, hours of retry delay).
+   * If false: short transient rate limit (TPM 250k cap, short retry in seconds).
+   */
+  public isDailyQuotaExceeded(errString: string): boolean {
+    const lower = errString.toLowerCase()
+
+    // Explicit Daily Metric or Quota ID markers
+    if (
+      lower.includes('generate_content_free_tier_requests') ||
+      lower.includes('generaterequestsperday') ||
+      lower.includes('requests per day') ||
+      lower.includes('perday') ||
+      lower.includes('per_day')
+    ) {
+      return true
+    }
+
+    // Daily limit 20 marker
+    if (/limit:\s*20\b/i.test(errString)) {
+      return true
+    }
+
+    // Parse retry delay: if hours, or seconds >= 300 (5 minutes), it is daily quota!
+    if (/retry in \d+h/i.test(errString)) {
+      return true
+    }
+    const secMatch = errString.match(/retry in (\d+)(?:\.\d+)?s/i) || errString.match(/retrydelay["']?:\s*["']?(\d+)s/i)
+    if (secMatch) {
+      const sec = parseFloat(secMatch[1])
+      if (sec >= 300) {
+        return true
+      }
+    }
+
+    return false
+  }
+
   /**
    * Helper to sleep with interrupt check every 500ms
    */
@@ -379,8 +456,10 @@ export class ChunkScanOrchestrator {
       }
     }
 
-    this.chokeRotationIdx = (this.chokeRotationIdx + 1) % availableSlots.length
-    const chosenSlot = overrideKeySlot || availableSlots[this.chokeRotationIdx]
+    let candidateSlots = availableSlots.filter((s) => !this.isKeyModelInCooldown(s, model))
+    if (candidateSlots.length === 0) candidateSlots = availableSlots
+    this.chokeRotationIdx = (this.chokeRotationIdx + 1) % candidateSlots.length
+    const chosenSlot = overrideKeySlot || candidateSlots[this.chokeRotationIdx]
     const apiKey = this.keyApiMap.get(chosenSlot)
 
     if (!apiKey) {
@@ -554,24 +633,26 @@ export class ChunkScanOrchestrator {
       if (is429) outcome = '429'
       else if (isTimeout) outcome = 'timeout'
 
-      const isRpd =
-        is429 &&
-        (lower.includes('generaterequestsperday') ||
-          lower.includes('generate_content_free_tier_requests') ||
-          lower.includes('perday') ||
-          lower.includes('per_day') ||
-          lower.includes('quota exceeded') ||
-          lower.includes('exceeded your current quota') ||
-          lower.includes('quotafailure') ||
-          lower.includes('quotametric') ||
-          lower.includes('resource_exhausted') ||
-          lower.includes('quota') ||
-          /limit:\s*\d+/i.test(errDetail) ||
-          /retry in \d+/i.test(errDetail) ||
-          /retrydelay/i.test(errDetail))
+      const isRpd = is429 && this.isDailyQuotaExceeded(errDetail)
 
       if (isRpd) {
         this.dropModelForToday(model, errDetail)
+      } else if (is429) {
+        // TPM rate limit: User rule: Model is NOT dropped for today! Only 1-min cooldown applied to this key
+        this.setKeyModelCooldown(chosenSlot, model, 60_000)
+        this.log({
+          timestamp: Date.now(),
+          type: 'warn',
+          model,
+          keySlot: chosenSlot,
+          message: `Choke ${model} hit 429 TPM Rate Limit on Key ${chosenSlot}. Model NOT dropped for today — 1-minute cooldown applied to Key ${chosenSlot}.`,
+        })
+      }
+
+      if (is503) {
+        // 503 Overload: apply 1-min cooldown on model and key
+        this.setModelCooldown(model, 60_000)
+        this.setKeyModelCooldown(chosenSlot, model, 60_000)
       }
 
       this.updateModelHealthFromLatency(model, latencyMs, outcome)
@@ -723,9 +804,10 @@ export class ChunkScanOrchestrator {
       // ==============================================================
       // STEP 2: PRIMARY 3.6 CHOKE PROBE
       // Probes gemini-3.6-flash with message "hy".
-      // If 3.6 succeeds -> launch 10 burst requests immediately (<3s).
+      // If 3.6 succeeds -> clear cooldown and launch 10 burst requests immediately (<3s).
       // (3.5 1-min choke is OFF while 3.6 burst is running).
-      // If 3.6 is dropped (429 RPD), skip directly to 3.7.
+      // User rule: When 3.5 canary succeeds, ALWAYS send 1 choke probe to 3.6
+      // to check if 3.6 is out of 503 overload or not!
       // ==============================================================
       if (this.isModelDroppedToday(ORCHESTRATOR_PRIMARY_MODEL)) {
         this.log({
@@ -741,37 +823,49 @@ export class ChunkScanOrchestrator {
           timestamp: Date.now(),
           type: 'choke',
           model: ORCHESTRATOR_PRIMARY_MODEL,
-          message: `Phase [choke_primary]: Probing Primary model ${ORCHESTRATOR_PRIMARY_MODEL} with "hy"...`,
+          message: `Phase [choke_primary]: Probing Primary model ${ORCHESTRATOR_PRIMARY_MODEL} with "hy" to check if out of 503 overload...`,
         })
 
         const primaryChoke = await this.probeChoke(ORCHESTRATOR_PRIMARY_MODEL)
 
         if (primaryChoke.ok) {
+          this.clearModelCooldown(ORCHESTRATOR_PRIMARY_MODEL)
           this.state.phase = 'burst_primary'
           this.log({
             timestamp: Date.now(),
             type: 'info',
             model: ORCHESTRATOR_PRIMARY_MODEL,
-            message: `Phase [burst_primary]: Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 10 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+            message: `Phase [burst_primary]: Primary 3.6 confirmed out of 503 overload (reply: "${primaryChoke.reply}"). Launching 10 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
           })
-          await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 10)
-          continue
+          const burstResult = await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 10)
+          if (burstResult.successes > 0) {
+            continue
+          } else if (burstResult.errors503 > 0) {
+            this.log({
+              timestamp: Date.now(),
+              type: 'failover',
+              model: ORCHESTRATOR_PRIMARY_MODEL,
+              message: `Primary 3.6 burst failed with 503 High Demand across chunks. Immediately failing over to Secondary 3.7...`,
+            })
+            // Fall through to Step 3 (Secondary 3.7)
+          } else {
+            continue
+          }
         } else {
           this.log({
             timestamp: Date.now(),
             type: 'failover',
             model: ORCHESTRATOR_PRIMARY_MODEL,
-            message: `Primary 3.6 choke failed (${primaryChoke.error || '503 High Demand'}). Immediately probing Secondary 3.7...`,
+            message: `Primary 3.6 choke failed (${primaryChoke.error || '503 High Demand'} — 3.6 still in overload). Immediately probing Secondary 3.7...`,
           })
         }
       }
 
       // ==============================================================
-      // STEP 3: SECONDARY 3.7 CHOKE PROBE (on 3.6 failure or dropped)
+      // STEP 3: SECONDARY 3.7 CHOKE PROBE (on 3.6 failure, dropped, or 503)
       // Probes gemini-3.7-flash with message "hy".
-      // If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
+      // If 3.7 succeeds -> clear cooldown and launch 4 burst requests immediately (<3s).
       // (3.5 1-min choke is OFF while 3.7 burst is running).
-      // If 3.7 is dropped (429 RPD), skip directly to 3.8.
       // ==============================================================
       if (this.isModelDroppedToday(ORCHESTRATOR_SECONDARY_MODEL)) {
         this.log({
@@ -787,35 +881,48 @@ export class ChunkScanOrchestrator {
           timestamp: Date.now(),
           type: 'choke',
           model: ORCHESTRATOR_SECONDARY_MODEL,
-          message: `Phase [choke_secondary]: Probing Secondary model ${ORCHESTRATOR_SECONDARY_MODEL} with "hy"...`,
+          message: `Phase [choke_secondary]: Probing Secondary model ${ORCHESTRATOR_SECONDARY_MODEL} with "hy" to check if out of 503 overload...`,
         })
 
         const secChoke = await this.probeChoke(ORCHESTRATOR_SECONDARY_MODEL)
 
         if (secChoke.ok) {
+          this.clearModelCooldown(ORCHESTRATOR_SECONDARY_MODEL)
           this.state.phase = 'burst_secondary'
           this.log({
             timestamp: Date.now(),
             type: 'info',
             model: ORCHESTRATOR_SECONDARY_MODEL,
-            message: `Phase [burst_secondary]: Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+            message: `Phase [burst_secondary]: Secondary 3.7 confirmed out of 503 overload (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
           })
-          await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL, 4)
-          continue
+          const burstResult = await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL, 4)
+          if (burstResult.successes > 0) {
+            continue
+          } else if (burstResult.errors503 > 0) {
+            this.log({
+              timestamp: Date.now(),
+              type: 'failover',
+              model: ORCHESTRATOR_SECONDARY_MODEL,
+              message: `Secondary 3.7 burst failed with 503 High Demand across chunks. Immediately failing over to Tertiary 3.8...`,
+            })
+            // Fall through to Step 4 (Tertiary 3.8)
+          } else {
+            continue
+          }
         } else {
           this.log({
             timestamp: Date.now(),
             type: 'failover',
             model: ORCHESTRATOR_SECONDARY_MODEL,
-            message: `Secondary 3.7 choke failed (${secChoke.error || '503 High Demand'}). Immediately probing Tertiary 3.8...`,
+            message: `Secondary 3.7 choke failed (${secChoke.error || '503 High Demand'} — 3.7 still in overload). Immediately probing Tertiary 3.8...`,
           })
         }
       }
 
       // ==============================================================
-      // STEP 4: TERTIARY 3.8 CHOKE PROBE (on 3.7 failure or dropped)
+      // STEP 4: TERTIARY 3.8 CHOKE PROBE (on 3.7 failure, dropped, or 503)
       // Probes gemini-3.8-flash with message "hy".
-      // If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
+      // If 3.8 succeeds -> clear cooldown and launch 4 burst requests immediately (<3s).
       // (3.5 1-min choke is OFF while 3.8 burst is running).
       // ==============================================================
       if (this.isModelDroppedToday(ORCHESTRATOR_TERTIARY_MODEL)) {
@@ -832,21 +939,41 @@ export class ChunkScanOrchestrator {
           timestamp: Date.now(),
           type: 'choke',
           model: ORCHESTRATOR_TERTIARY_MODEL,
-          message: `Phase [choke_tertiary]: Probing Tertiary model ${ORCHESTRATOR_TERTIARY_MODEL} with "hy"...`,
+          message: `Phase [choke_tertiary]: Probing Tertiary model ${ORCHESTRATOR_TERTIARY_MODEL} with "hy" to check if out of 503 overload...`,
         })
 
         const tertChoke = await this.probeChoke(ORCHESTRATOR_TERTIARY_MODEL)
 
         if (tertChoke.ok) {
+          this.clearModelCooldown(ORCHESTRATOR_TERTIARY_MODEL)
           this.state.phase = 'burst_tertiary'
           this.log({
             timestamp: Date.now(),
             type: 'info',
             model: ORCHESTRATOR_TERTIARY_MODEL,
-            message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+            message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed out of 503 overload (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
           })
-          await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL, 4)
-          continue
+          const burstResult = await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL, 4)
+          if (burstResult.successes > 0) {
+            continue
+          } else if (burstResult.errors503 > 0) {
+            this.log({
+              timestamp: Date.now(),
+              type: 'failover',
+              model: ORCHESTRATOR_TERTIARY_MODEL,
+              message: `Tertiary 3.8 burst failed with 503 High Demand across chunks. All worker models in 503 overload.`,
+            })
+            // Fall through to Step 5
+          } else {
+            continue
+          }
+        } else {
+          this.log({
+            timestamp: Date.now(),
+            type: 'failover',
+            model: ORCHESTRATOR_TERTIARY_MODEL,
+            message: `Tertiary 3.8 choke failed (${tertChoke.error || '503 High Demand'}). All worker models in 503 overload.`,
+          })
         }
       }
 
@@ -882,7 +1009,10 @@ export class ChunkScanOrchestrator {
    * - If any chunk encounters 503:
    *     NO retry on this burst, NO cooldown on key. Chunk is queued for next cycle.
    */
-  private async executeBurst(model: string, burstCountOverride?: number): Promise<void> {
+  private async executeBurst(
+    model: string,
+    burstCountOverride?: number,
+  ): Promise<{ launched: number; successes: number; errors503: number; errors429: number; timeouts: number }> {
     const defaultMax = model === ORCHESTRATOR_PRIMARY_MODEL ? 10 : 4
     const maxParallel = burstCountOverride || ORCHESTRATOR_BURST_MAX[model] || defaultMax
 
@@ -891,6 +1021,8 @@ export class ChunkScanOrchestrator {
     for (const c of this.chunkQueue) {
       if (c.status === 'failed' || c.status === 'parked') {
         c.status = 'pending'
+        c.assignedKey = undefined
+        c.assignedModel = undefined
         retriedCount++
       }
     }
@@ -907,9 +1039,13 @@ export class ChunkScanOrchestrator {
     this.lastBatchTime = Date.now()
 
     // Find available worker key slots that are currently idle (slots 2..13, 15, 16)
+    // and NOT in 1-minute TPM cooldown for this model
     const availableSlots = Array.from(this.keyApiMap.keys()).filter((s) => {
       const slotState = this.state.slots[s]
       if (!slotState || slotState.status === 'processing' || slotState.status === 'reserved' || slotState.status === 'skipped') {
+        return false
+      }
+      if (this.isKeyModelInCooldown(s, model)) {
         return false
       }
       slotState.status = 'idle'
@@ -917,14 +1053,21 @@ export class ChunkScanOrchestrator {
     })
 
     if (availableSlots.length === 0) {
+      let minRemainingMs = 60_000
+      for (const s of this.keyApiMap.keys()) {
+        const cd = this.getKeyModelCooldown(s, model)
+        if (cd > Date.now()) {
+          minRemainingMs = Math.min(minRemainingMs, cd - Date.now())
+        }
+      }
       this.log({
         timestamp: Date.now(),
         type: 'warn',
         model,
-        message: 'No idle worker key slots available to launch burst.',
+        message: `All worker keys for ${model} are in 1-min TPM cooldown (${Math.ceil(minRemainingMs / 1000)}s remaining). Waiting for keys to cool down...`,
       })
-      await new Promise((r) => setTimeout(r, 2000))
-      return
+      await this.sleepWithInterrupt(Math.min(minRemainingMs, 5000))
+      return { launched: 0, successes: 0, errors503: 0, errors429: 0, timeouts: 0 }
     }
 
     // Rotate starting slot so all worker keys get equal opportunities
@@ -949,6 +1092,11 @@ export class ChunkScanOrchestrator {
       message: `Launching ${slotsToUse.length} parallel burst requests on ${model} across Keys [${slotsToUse.join(', ')}] within 3s...`,
     })
 
+    let totalSuccesses = 0
+    let total503 = 0
+    let total429 = 0
+    let totalTimeouts = 0
+
     const inFlightPromises: Promise<void>[] = []
 
     for (let i = 0; i < slotsToUse.length; i++) {
@@ -967,17 +1115,23 @@ export class ChunkScanOrchestrator {
           if (!nextChunk) break
 
           const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
-          if (outcome === '503') {
-            // 503 High Demand: no retry on this burst, key has NO cooldown, chunk queued for next cycle
+          if (outcome === 'success') {
+            totalSuccesses++
+          } else if (outcome === '503') {
+            total503++
             this.log({
               timestamp: Date.now(),
               type: 'warn',
               model,
               keySlot: slot,
-              message: `503 High Demand on Key ${slot} — no retry on this burst; Key has NO cooldown. Chunk #${nextChunk.index} queued for next cycle.`,
+              message: `503 High Demand on Key ${slot} — 1-minute cooldown applied to Key ${slot} for ${model} (TPM safety). Chunk #${nextChunk.index} queued for next cycle.`,
             })
             break
-          } else if (outcome !== 'success') {
+          } else if (outcome === '429') {
+            total429++
+            break
+          } else {
+            totalTimeouts++
             break
           }
         }
@@ -988,6 +1142,25 @@ export class ChunkScanOrchestrator {
 
     if (inFlightPromises.length > 0) {
       await Promise.all(inFlightPromises)
+    }
+
+    if (total503 > 0 && totalSuccesses === 0) {
+      this.setModelCooldown(model, 60_000)
+      this.log({
+        timestamp: Date.now(),
+        type: 'failover',
+        model,
+        outcome: '503',
+        message: `All ${total503} chunk request(s) on ${model} returned 503 High Demand. 1-minute cooldown applied to ${model}.`,
+      })
+    }
+
+    return {
+      launched: slotsToUse.length,
+      successes: totalSuccesses,
+      errors503: total503,
+      errors429: total429,
+      timeouts: totalTimeouts,
     }
   }
 
@@ -1008,6 +1181,9 @@ export class ChunkScanOrchestrator {
     chunk.assignedModel = model
     chunk.startedAt = Date.now()
     chunk.attempts++
+
+    // Set 1-minute cooldown from request dispatch time (TPM 250k protection)
+    this.setKeyModelCooldown(slot, model, 60_000)
 
     slotState.status = 'processing'
     slotState.activeModel = model
@@ -1085,35 +1261,26 @@ export class ChunkScanOrchestrator {
       if (outcome === '503') {
         slotState.errors503++
         this.updateModelHealthFromLatency(model, latencyMs, '503')
+        // User rule: 1-minute cooldown on this key for this model
+        this.setKeyModelCooldown(slot, model, 60_000)
       } else if (outcome === '429') {
         slotState.errors429++
         this.updateModelHealthFromLatency(model, latencyMs, '429')
+        this.setKeyModelCooldown(slot, model, 60_000)
       } else if (outcome === 'timeout') {
         slotState.timeouts++
         this.updateModelHealthFromLatency(model, latencyMs, 'timeout')
       }
 
-      // Check if 429 is Daily Quota Exceeded (RPD)
-      const isRpd =
-        outcome === '429' &&
-        (lower.includes('exceeded your current quota') ||
-          lower.includes('quota exceeded') ||
-          lower.includes('resource_exhausted') ||
-          lower.includes('generaterequestsperday') ||
-          lower.includes('generate_content_free_tier_requests') ||
-          lower.includes('quotafailure') ||
-          lower.includes('quotametric') ||
-          lower.includes('perday') ||
-          lower.includes('per_day') ||
-          lower.includes('quota') ||
-          /limit:\s*\d+/i.test(msg) ||
-          /retry in \d+/i.test(msg) ||
-          /retrydelay/i.test(msg))
+      // Check if 429 is Daily Quota Exceeded (RPD) vs TPM Rate Limit
+      const isDailyQuota = outcome === '429' && this.isDailyQuotaExceeded(msg)
 
-      if (isRpd) {
+      if (isDailyQuota) {
         this.dropModelForToday(model, msg)
         // User rule: 429 RPD exhausted -> model dropped for today, and return chunk BACK to queue immediately
         chunk.status = 'pending'
+        chunk.assignedKey = undefined
+        chunk.assignedModel = undefined
         this.log({
           timestamp: Date.now(),
           type: 'chunk',
@@ -1122,11 +1289,30 @@ export class ChunkScanOrchestrator {
           chunkIndex: chunk.index,
           outcome: '429',
           latencyMs,
-          message: `Chunk #${chunk.index} hit 429 Daily Quota Exceeded on ${model}. Model DROPPED for today — chunk returned to queue for failover retry.`,
+          message: `Chunk #${chunk.index} hit 429 Daily Quota Exceeded (RPD) on ${model}. Model DROPPED for today — chunk returned to queue for failover retry.`,
+        })
+      } else if (outcome === '429') {
+        // TPM (Tokens Per Minute) 250k limit hit!
+        // User rule: Model is NOT dropped for today! Only 1-minute cooldown applied to this key, chunk returned to queue
+        chunk.status = 'pending'
+        chunk.assignedKey = undefined
+        chunk.assignedModel = undefined
+        this.setKeyModelCooldown(slot, model, 60_000)
+        this.log({
+          timestamp: Date.now(),
+          type: 'chunk',
+          model,
+          keySlot: slot,
+          chunkIndex: chunk.index,
+          outcome: '429',
+          latencyMs,
+          message: `Chunk #${chunk.index} hit 429 TPM Rate Limit (250K cap) on Key ${slot}. Model NOT dropped for today. 1-minute cooldown applied to Key ${slot} — chunk returned to queue for next ready key/failover.`,
         })
       } else {
         // 503 and transient errors: re-queue for next burst cycle retry
-        chunk.status = 'failed'
+        chunk.status = 'pending'
+        chunk.assignedKey = undefined
+        chunk.assignedModel = undefined
         this.log({
           timestamp: Date.now(),
           type: 'chunk',
@@ -1135,10 +1321,12 @@ export class ChunkScanOrchestrator {
           chunkIndex: chunk.index,
           outcome,
           latencyMs,
-          message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. Re-queued for retry in next burst cycle.`,
+          message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. 1-minute cooldown applied to Key ${slot}. Re-queued for retry in next burst cycle.`,
         })
       }
     } finally {
+      // User rule: from request finish / error time, ensure 1-min cooldown on this key for this model
+      this.setKeyModelCooldown(slot, model, 60_000)
       slotState.status = 'idle'
       slotState.activeChunk = null
       slotState.chunkStartedAt = null
