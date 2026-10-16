@@ -17,6 +17,7 @@ import {
   ORCHESTRATOR_CHUNK_TIMEOUT_MS,
   ORCHESTRATOR_CHOKE_TIMEOUT_MS,
   ORCHESTRATOR_BURST_MAX,
+} from './models'
 import { getApiKeyN, incrementModelUsage, forceModelExhausted } from './store'
 
 export interface ChunkQueueItem {
@@ -118,8 +119,8 @@ export class ChunkScanOrchestrator {
       [ORCHESTRATOR_PRIMARY_MODEL]: {
         modelId: ORCHESTRATOR_PRIMARY_MODEL,
         role: 'primary',
-        status: 'healthy',
-        effectiveParallelism: ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_PRIMARY_MODEL] || 10,
+        status: this.droppedModelsToday?.has(ORCHESTRATOR_PRIMARY_MODEL) ? 'exhausted' : 'healthy',
+        effectiveParallelism: this.droppedModelsToday?.has(ORCHESTRATOR_PRIMARY_MODEL) ? 0 : (ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_PRIMARY_MODEL] || 10),
         total503: 0,
         total429: 0,
         totalTimeouts: 0,
@@ -128,8 +129,8 @@ export class ChunkScanOrchestrator {
       [ORCHESTRATOR_SECONDARY_MODEL]: {
         modelId: ORCHESTRATOR_SECONDARY_MODEL,
         role: 'secondary',
-        status: 'healthy',
-        effectiveParallelism: ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_SECONDARY_MODEL] || 4,
+        status: this.droppedModelsToday?.has(ORCHESTRATOR_SECONDARY_MODEL) ? 'exhausted' : 'healthy',
+        effectiveParallelism: this.droppedModelsToday?.has(ORCHESTRATOR_SECONDARY_MODEL) ? 0 : (ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_SECONDARY_MODEL] || 4),
         total503: 0,
         total429: 0,
         totalTimeouts: 0,
@@ -138,8 +139,8 @@ export class ChunkScanOrchestrator {
       [ORCHESTRATOR_TERTIARY_MODEL]: {
         modelId: ORCHESTRATOR_TERTIARY_MODEL,
         role: 'tertiary',
-        status: 'healthy',
-        effectiveParallelism: ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_TERTIARY_MODEL] || 4,
+        status: this.droppedModelsToday?.has(ORCHESTRATOR_TERTIARY_MODEL) ? 'exhausted' : 'healthy',
+        effectiveParallelism: this.droppedModelsToday?.has(ORCHESTRATOR_TERTIARY_MODEL) ? 0 : (ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_TERTIARY_MODEL] || 4),
         total503: 0,
         total429: 0,
         totalTimeouts: 0,
@@ -157,10 +158,14 @@ export class ChunkScanOrchestrator {
       },
     }
 
+    const healthyModels = [ORCHESTRATOR_PRIMARY_MODEL, ORCHESTRATOR_SECONDARY_MODEL, ORCHESTRATOR_TERTIARY_MODEL].filter(
+      (m) => !this.droppedModelsToday?.has(m),
+    )
+
     return {
       phase: 'idle',
-      activeModel: ORCHESTRATOR_PRIMARY_MODEL,
-      healthyModels: [ORCHESTRATOR_PRIMARY_MODEL, ORCHESTRATOR_SECONDARY_MODEL, ORCHESTRATOR_TERTIARY_MODEL],
+      activeModel: healthyModels[0] || ORCHESTRATOR_PRIMARY_MODEL,
+      healthyModels,
       canaryActive: false,
       slots,
       models,
@@ -555,10 +560,15 @@ export class ChunkScanOrchestrator {
           lower.includes('generate_content_free_tier_requests') ||
           lower.includes('perday') ||
           lower.includes('per_day') ||
-          lower.includes('quota exceeded for metric') ||
-          /limit:\s*20/i.test(errDetail) ||
-          /retry in \d+h/i.test(errDetail) ||
-          /retry in \d+m/i.test(errDetail))
+          lower.includes('quota exceeded') ||
+          lower.includes('exceeded your current quota') ||
+          lower.includes('quotafailure') ||
+          lower.includes('quotametric') ||
+          lower.includes('resource_exhausted') ||
+          lower.includes('quota') ||
+          /limit:\s*\d+/i.test(errDetail) ||
+          /retry in \d+/i.test(errDetail) ||
+          /retrydelay/i.test(errDetail))
 
       if (isRpd) {
         this.dropModelForToday(model, errDetail)
@@ -717,7 +727,6 @@ export class ChunkScanOrchestrator {
       // (3.5 1-min choke is OFF while 3.6 burst is running).
       // If 3.6 is dropped (429 RPD), skip directly to 3.7.
       // ==============================================================
-      let primaryChokeSuccess = false
       if (this.isModelDroppedToday(ORCHESTRATOR_PRIMARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
@@ -738,7 +747,6 @@ export class ChunkScanOrchestrator {
         const primaryChoke = await this.probeChoke(ORCHESTRATOR_PRIMARY_MODEL)
 
         if (primaryChoke.ok) {
-          primaryChokeSuccess = true
           this.state.phase = 'burst_primary'
           this.log({
             timestamp: Date.now(),
@@ -765,7 +773,6 @@ export class ChunkScanOrchestrator {
       // (3.5 1-min choke is OFF while 3.7 burst is running).
       // If 3.7 is dropped (429 RPD), skip directly to 3.8.
       // ==============================================================
-      let secChokeSuccess = false
       if (this.isModelDroppedToday(ORCHESTRATOR_SECONDARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
@@ -786,7 +793,6 @@ export class ChunkScanOrchestrator {
         const secChoke = await this.probeChoke(ORCHESTRATOR_SECONDARY_MODEL)
 
         if (secChoke.ok) {
-          secChokeSuccess = true
           this.state.phase = 'burst_secondary'
           this.log({
             timestamp: Date.now(),
@@ -1087,19 +1093,51 @@ export class ChunkScanOrchestrator {
         this.updateModelHealthFromLatency(model, latencyMs, 'timeout')
       }
 
-      // 503, 429, and timeouts are transient infrastructure / server errors.
-      // They MUST NEVER park the chunk! Re-queue for next burst cycle retry.
-      chunk.status = 'failed'
-      this.log({
-        timestamp: Date.now(),
-        type: 'chunk',
-        model,
-        keySlot: slot,
-        chunkIndex: chunk.index,
-        outcome,
-        latencyMs,
-        message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. Re-queued for retry in next burst cycle.`,
-      })
+      // Check if 429 is Daily Quota Exceeded (RPD)
+      const isRpd =
+        outcome === '429' &&
+        (lower.includes('exceeded your current quota') ||
+          lower.includes('quota exceeded') ||
+          lower.includes('resource_exhausted') ||
+          lower.includes('generaterequestsperday') ||
+          lower.includes('generate_content_free_tier_requests') ||
+          lower.includes('quotafailure') ||
+          lower.includes('quotametric') ||
+          lower.includes('perday') ||
+          lower.includes('per_day') ||
+          lower.includes('quota') ||
+          /limit:\s*\d+/i.test(msg) ||
+          /retry in \d+/i.test(msg) ||
+          /retrydelay/i.test(msg))
+
+      if (isRpd) {
+        this.dropModelForToday(model, msg)
+        // User rule: 429 RPD exhausted -> model dropped for today, and return chunk BACK to queue immediately
+        chunk.status = 'pending'
+        this.log({
+          timestamp: Date.now(),
+          type: 'chunk',
+          model,
+          keySlot: slot,
+          chunkIndex: chunk.index,
+          outcome: '429',
+          latencyMs,
+          message: `Chunk #${chunk.index} hit 429 Daily Quota Exceeded on ${model}. Model DROPPED for today — chunk returned to queue for failover retry.`,
+        })
+      } else {
+        // 503 and transient errors: re-queue for next burst cycle retry
+        chunk.status = 'failed'
+        this.log({
+          timestamp: Date.now(),
+          type: 'chunk',
+          model,
+          keySlot: slot,
+          chunkIndex: chunk.index,
+          outcome,
+          latencyMs,
+          message: `Chunk #${chunk.index} encountered ${outcome.toUpperCase()} (High Demand / Overloaded) on Key ${slot}. Re-queued for retry in next burst cycle.`,
+        })
+      }
     } finally {
       slotState.status = 'idle'
       slotState.activeChunk = null
