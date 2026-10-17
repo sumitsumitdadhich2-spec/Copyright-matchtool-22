@@ -93,15 +93,38 @@ export function Dashboard() {
   const canStart = Boolean(scan && !running && !queued && status === 'ready' && scan.chunkCount > 0 && !scanBlocked)
 
   // Unverified candidate groups or unverified matches that need verification/rescan
-  const hasUnverifiedWork = Boolean(
-    scan &&
-      ((scan.candidateGroups || []).some(
-        (g) => g.status === 'unverified' || g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning',
-      ) ||
-        (scan.matches || []).some(
-          (m) => m.verified === undefined || (m.verified === false && !m.rejected && !m.userPick),
-        )),
-  )
+  const unverifiedGroupCount = scan
+    ? (scan.candidateGroups || []).filter((g) => {
+        if (g.userPick || g.status === 'confirmed') return false
+        if (g.status === 'unverified' || g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning') {
+          return true
+        }
+        const isSuperseded =
+          Boolean(g.superseded) ||
+          (g.candidates.length > 0 && g.candidates.every((c) => c.verifierReason?.startsWith('superseded')))
+        if (g.status === 'rejected' && !isSuperseded) {
+          return g.candidates.some(
+            (c) =>
+              c.verdict === 'pending' ||
+              c.verdict === 'verifying' ||
+              !c.verifierModel ||
+              c.rescan === 'none' ||
+              c.rescan === 'rescanning' ||
+              (c.rescan === 'found' && c.rescanVerdict !== 'different') ||
+              c.rescanReason === 'Verifier gave no clear verdict across retries',
+          )
+        }
+        return false
+      }).length
+    : 0
+
+  const unverifiedMatchCount = scan
+    ? (scan.matches || []).filter(
+        (m) => m.verified === undefined || (m.verified === false && !m.rejected && !m.userPick),
+      ).length
+    : 0
+
+  const hasUnverifiedWork = Boolean(scan && (unverifiedGroupCount > 0 || unverifiedMatchCount > 0))
 
   // Segments-aware: any incomplete minute (or any resumable chunk inside one) allows Resume.
   const hasResumableWork = Boolean(
@@ -500,7 +523,7 @@ export function Dashboard() {
             <div>
               <p className={`text-sm font-semibold ${hasUnverifiedWork ? 'text-amber-200' : 'text-emerald-200'}`}>
                 {hasUnverifiedWork
-                  ? `Scan Finished with ${scan.candidateGroups?.filter((g) => g.status === 'unverified').length || 'some'} Unverified Candidate(s)`
+                  ? `Scan Finished with ${unverifiedGroupCount || unverifiedMatchCount || 'some'} Unverified Candidate(s)`
                   : 'Scan Completed Successfully!'}
               </p>
               <p className={`text-xs ${hasUnverifiedWork ? 'text-amber-300/80' : 'text-emerald-300/80'}`}>

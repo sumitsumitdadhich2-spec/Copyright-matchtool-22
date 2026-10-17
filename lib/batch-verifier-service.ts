@@ -516,12 +516,15 @@ export async function verifySingleMinute(
               group.candidates[candIdx].verifierModel = chosenModel
             }
           } else {
-            group.status = 'rejected'
             if (candIdx >= 0) {
               group.candidates[candIdx].verdict = 'different'
               group.candidates[candIdx].verifierReason = p.reason
               group.candidates[candIdx].verifierModel = chosenModel
             }
+            const hasRemainingCandidates = group.candidates.some(
+              (c) => c.verdict === 'pending' || c.verdict === 'verifying' || c.rescan === 'none',
+            )
+            group.status = hasRemainingCandidates ? 'unverified' : 'rejected'
           }
         }
       }

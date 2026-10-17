@@ -274,11 +274,13 @@ class Scheduler {
     // marked cancelled (skipped) so only in-range chunks consume API quota.
     for (const seg of segments) {
       // TWELVE LABS PRE-FILTER: the persisted per-minute chunk selection is only
-      // honoured while the user's TL key is set. No key = feature fully off —
-      // clear the selection so EVERYTHING scans (normal full scan, zero impact).
-      if (!tlApiKey && Array.isArray(seg.prefilterChunks)) delete seg.prefilterChunks
+      // honoured while the user's TL key is set (when mode was 'prefiltered').
+      if (!tlApiKey && scan.prefilter?.mode === 'prefiltered' && Array.isArray(seg.prefilterChunks)) {
+        delete seg.prefilterChunks
+      }
       for (const c of seg.chunks) {
         const inRange = chunkOverlapsSegRange(scan, seg, c.index)
+        const isPrefilteredOut = Array.isArray(seg.prefilterChunks) && !seg.prefilterChunks.includes(c.index)
         const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
 
         // Any chunk without genuine result (match / no_match) that is in range must be revived to pending
@@ -292,7 +294,7 @@ class Scheduler {
           // minute's movie range after a run leaves the newly chosen part
           // permanently skipped. EXCEPTION: early-stop-skipped chunks of a DONE
           // minute stay skipped — us minute ke saare matches confirm ho chuke hain.
-          if (c.status === 'cancelled' && inRange && !(c.skippedEarlyStop && seg.status === 'done')) {
+          if (c.status === 'cancelled' && inRange && !isPrefilteredOut && !(c.skippedEarlyStop && seg.status === 'done')) {
             c.status = 'pending'
             delete c.skippedEarlyStop
           }
@@ -300,7 +302,7 @@ class Scheduler {
         if (c.status === 'pending' && !inRange) c.status = 'cancelled'
         // Re-apply the persisted pre-filter selection (resume path). A fresh
         // pre-filter run inside runScan() recomputes/overrides this anyway.
-        if (c.status === 'pending' && Array.isArray(seg.prefilterChunks) && !seg.prefilterChunks.includes(c.index)) {
+        if (c.status === 'pending' && isPrefilteredOut) {
           c.status = 'cancelled'
         }
       }
@@ -342,6 +344,13 @@ class Scheduler {
       (!scan.candidateGroups?.length && (scan.matches || []).length > 0 && allSettled)
 
     if (pendingChunks === 0 && !hasVerifyWork) return { ok: false, error: 'No pending chunks or unverified candidates to scan.' }
+
+    // If resuming specifically to verify remaining candidates while all chunks are already done,
+    // ensure verifierEnabled is turned ON so the verification + rescan pipeline actually runs.
+    if (isScanResuming && pendingChunks === 0 && hasVerifyWork && scan.verifierEnabled === false) {
+      scan.verifierEnabled = true
+      addLog(scan, 'info', 'Verifier auto-enabled for Resume to verify and rescan pending/unverified candidate(s).')
+    }
 
     // Mirror the first incomplete SELECTED segment's chunks so the UI shows the right minute.
     const firstIncomplete = selectedSegs.find((s) => s.status !== 'done') || selectedSegs[0] || segments[0]
@@ -1116,7 +1125,9 @@ class Scheduler {
         delete seg.chunkConfidence
         delete seg.tlWindows
         for (const c of seg.chunks) {
-          if (c.status === 'cancelled' && chunkOverlapsSegRange(scan, seg, c.index)) c.status = 'pending'
+          if (c.status === 'cancelled' && !c.skippedEarlyStop && chunkOverlapsSegRange(scan, seg, c.index)) {
+            c.status = 'pending'
+          }
         }
         if (seg.status === 'done' && seg.chunks.some((c) => c.status === 'pending')) seg.status = 'pending'
       }
@@ -1320,8 +1331,9 @@ class Scheduler {
       for (const seg of activeSegments) {
         for (const c of seg.chunks) {
           const inRange = chunkOverlapsSegRange(scan, seg, c.index)
+          const isPrefilteredOut = Array.isArray(seg.prefilterChunks) && !seg.prefilterChunks.includes(c.index)
           const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
-          if (!isGenuinelyFinished && inRange && !c.skippedEarlyStop) {
+          if (!isGenuinelyFinished && inRange && !isPrefilteredOut && !c.skippedEarlyStop) {
             c.status = 'pending'
           }
         }
@@ -1705,8 +1717,44 @@ class Scheduler {
    *  Candidates are unlimited — every distinct movie window or chunk finding is saved. */
   private buildCandidateGroups(scan: Scan) {
     const groups: CandidateGroup[] = scan.candidateGroups || []
-    const sorted = [...(scan.matches || [])]
-      .sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+
+    // Collect all matches from both scan.matches AND per-chunk matches across all shortSegments/chunks
+    // so that no candidate from any chunk is ever lost even if scan.matches was deduplicated.
+    const rawPool: ChunkMatch[] = [...(scan.matches || [])]
+    for (const seg of scan.shortSegments || []) {
+      for (const ch of seg.chunks || []) {
+        if (Array.isArray(ch.matches)) {
+          for (const cm of ch.matches) {
+            const existsInPool = rawPool.some(
+              (p) =>
+                p.chunkIndex === cm.chunkIndex &&
+                Math.abs(p.shortStart - cm.shortStart) < 0.2 &&
+                Math.abs(p.shortEnd - cm.shortEnd) < 0.2 &&
+                Math.abs(p.movieStart - cm.movieStart) < 0.5 &&
+                Math.abs(p.movieEnd - cm.movieEnd) < 0.5,
+            )
+            if (!existsInPool) rawPool.push(cm)
+          }
+        }
+      }
+    }
+    for (const ch of scan.chunks || []) {
+      if (Array.isArray(ch.matches)) {
+        for (const cm of ch.matches) {
+          const existsInPool = rawPool.some(
+            (p) =>
+              p.chunkIndex === cm.chunkIndex &&
+              Math.abs(p.shortStart - cm.shortStart) < 0.2 &&
+              Math.abs(p.shortEnd - cm.shortEnd) < 0.2 &&
+              Math.abs(p.movieStart - cm.movieStart) < 0.5 &&
+              Math.abs(p.movieEnd - cm.movieEnd) < 0.5,
+          )
+          if (!existsInPool) rawPool.push(cm)
+        }
+      }
+    }
+
+    const sorted = rawPool.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
     for (const m of sorted) {
       let g = groups.find((x) => sameShortSegment(x.shortStart, x.shortEnd, m.shortStart, m.shortEnd))
       if (!g) {
@@ -1751,7 +1799,7 @@ class Scheduler {
           g.shortStart = Math.min(g.shortStart, m.shortStart)
           g.shortEnd = Math.max(g.shortEnd, m.shortEnd)
         }
-        // New evidence for an already-finished group (manual chunk retry) — reopen it if unverified.
+        // New evidence for an already-finished group (manual chunk retry or multi-chunk candidate) — reopen it if not confirmed.
         if (g.status === 'rejected' || g.status === 'unverified') g.status = 'pending'
       }
 
@@ -1777,13 +1825,38 @@ class Scheduler {
   }
 
   /** Reset transient candidate-group states left over from an interrupted run,
-   *  and revive unverified candidate groups so that Resume can re-verify and rescan them! */
+   *  and revive unverified or incomplete candidate groups so that Resume can re-verify and rescan them! */
   private prepareVerifyState(scan: Scan) {
+    this.buildCandidateGroups(scan)
     for (const g of scan.candidateGroups || []) {
       // User manual picks and confirmed groups are preserved!
       if (g.userPick || g.status === 'confirmed') continue
 
-      if (g.status === 'verifying' || g.status === 'rescanning' || g.status === 'unverified') {
+      const isSuperseded =
+        Boolean(g.superseded) ||
+        (g.candidates.length > 0 && g.candidates.every((c) => c.verifierReason?.startsWith('superseded')))
+
+      const isIncompleteRejected =
+        g.status === 'rejected' &&
+        !isSuperseded &&
+        g.candidates.some(
+          (c) =>
+            c.verdict === 'pending' ||
+            c.verdict === 'verifying' ||
+            !c.verifierModel ||
+            c.rescan === 'none' ||
+            c.rescan === 'rescanning' ||
+            (c.rescan === 'found' && c.rescanVerdict !== 'different') ||
+            c.rescanReason === 'Verifier gave no clear verdict across retries',
+        )
+
+      if (
+        g.status === 'verifying' ||
+        g.status === 'rescanning' ||
+        g.status === 'unverified' ||
+        g.status === 'pending' ||
+        isIncompleteRejected
+      ) {
         g.status = 'pending'
         g.attempts = 0
         g.confirmedIndex = null
@@ -1802,6 +1875,9 @@ class Scheduler {
           }
         }
       }
+    }
+    for (const g of scan.candidateGroups || []) {
+      applyGroupMatches(scan, g)
     }
   }
 
@@ -1988,12 +2064,19 @@ class Scheduler {
       const st = this.modelState(job, lane, m)
 
       if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) {
-        if (st.state !== 'exhausted') {
-          st.state = 'exhausted'
-          st.currentChunk = null
-          this.mark(job)
+        // User rule: "rpd khtm hone pr un model ko block mat krna req fir bhi kr ske"
+        // Only retire this worker if at least one other (lane × verify model) in the pool is NOT exhausted.
+        const anyNonExhaustedVerifyLane = job.lanes.some((l) =>
+          VERIFY_MODEL_POOL.some((vm) => !globalGeminiCoordinator.isModelExhausted(l.apiKey, vm.id, vm.rpd)),
+        )
+        if (anyNonExhaustedVerifyLane) {
+          if (st.state !== 'exhausted') {
+            st.state = 'exhausted'
+            st.currentChunk = null
+            this.mark(job)
+          }
+          return
         }
-        return
       }
 
       const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
@@ -2432,17 +2515,12 @@ class Scheduler {
       : undefined
 
     // VERIFY models: gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY (500 RPD each).
-    // Instant pre-flight check: ensure quota remaining before cutting clips or uploading
+    // Prefer non-exhausted model on this key, but per user rule ("rpd khtm hone pr un model ko block mat krna")
+    // fall back to `m` rather than throwing if nominal RPD was reached.
     const pickVerifyModel = (): ModelSpec => {
       if (!globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) return m
       const fallback = VERIFY_MODEL_POOL.find((x) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, x.id, x.rpd))
-      if (!fallback) {
-        throw new GeminiError(
-          'other',
-          `Verify models (${VERIFY_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — group re-queued for another key`,
-        )
-      }
-      return fallback
+      return fallback || m
     }
 
     g.status = 'verifying'
@@ -2632,6 +2710,7 @@ class Scheduler {
               : undefined
 
           let rescanFound: { start: number; end: number } | null = null
+          let rescanSucceeded = false
           const MAX_RESCAN_TRIES = Math.min(4, rescanCandidateLanes.length)
 
           for (let tryIdx = 0; tryIdx < MAX_RESCAN_TRIES; tryIdx++) {
@@ -2688,6 +2767,7 @@ class Scheduler {
               incrementModelUsage(chosenRm.id, chosenLane.apiKey)
               globalGeminiCoordinator.recordSuccess(chosenLane.apiKey, chosenRm.id, 0)
 
+              rescanSucceeded = true
               rescanFound = parseRescanMatch(raw)
               break
             } catch (reqErr) {
@@ -2719,6 +2799,19 @@ class Scheduler {
               if (shortUp) void deleteFileQuiet(chosenLane.ai, shortUp.name)
               if (chunkUp) void deleteFileQuiet(chosenLane.ai, chunkUp.name)
             }
+          }
+
+          if (!rescanSucceeded) {
+            c.rescan = 'none'
+            g.status = 'unverified'
+            this.applyGroupResult(job, g)
+            this.mark(job)
+            addLog(
+              scan,
+              'warn',
+              `Rescan of chunk ${c.chunkIndex} for short ${ts(g.shortStart)}–${ts(g.shortEnd)} could not complete across ${MAX_RESCAN_TRIES} attempts — kept as unverified (use Resume to retry)`,
+            )
+            return
           }
 
           if (!rescanFound) {
@@ -2833,10 +2926,17 @@ class Scheduler {
         }
 
         if (!reVerifyVerdict) {
-          c.rescanVerdict = 'different'
-          c.rescanReason = 'Verifier gave no clear verdict across retries'
+          delete c.rescanVerdict
+          delete c.rescanReason
+          g.status = 'unverified'
+          this.applyGroupResult(job, g)
           this.mark(job)
-          continue
+          addLog(
+            scan,
+            'warn',
+            `Re-verify of rescan window for short ${ts(g.shortStart)}–${ts(g.shortEnd)} could not complete across retries — kept as unverified (use Resume to retry)`,
+          )
+          return
         }
 
         c.rescanReason = reVerifyVerdict.reason
