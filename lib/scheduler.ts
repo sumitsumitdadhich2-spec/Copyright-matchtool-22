@@ -1293,7 +1293,7 @@ class Scheduler {
       verifyPhase = Promise.all(ws)
     }
     job.chunkPhaseDone = false
-    startVerifyWorkers()
+    // Normal verifier will start strictly AFTER all chunk scans are complete
 
     // OUTER PASSES: agar early-stop ke baad koi group REJECT ho jaye aur uske
     // minute ke skipped chunks wapas pending ho jayen, to ek aur pass chalega.
@@ -1303,8 +1303,7 @@ class Scheduler {
 
       // MULTI-MINUTE CHUNK PASSES:
       // The OrchestratorCore scans all selected minute segments unifiedly so that when
-      // a burst of 10 requests (or 4 requests on 3.7/3.8) is available, it pulls pending chunks
-      // across all remaining minutes rather than being bottlenecked to just 1 minute!
+      // a burst of requests is available, it pulls pending chunks across all remaining minutes
       const activeSegments = segments.filter((s) => s.selected !== false)
 
       // Revive any chunks that do not have real result (match / no_match) and are not legitimately cancelled
@@ -1332,7 +1331,7 @@ class Scheduler {
         )
         this.mark(job)
 
-        // MATCHTOOL CHUNK SCAN ORCHESTRATOR: Choke (3.5 -> 3.6 -> 3.7 -> 3.8) -> Burst (10/4/4 within 3s) -> Unlimited Recovery Watch
+        // MATCHTOOL CHUNK SCAN ORCHESTRATOR: Choke (3.5 -> 3.6 -> 3.7 -> 3.8) -> Burst (4/4/4 within 3s) -> Unlimited Recovery Watch
         await this.runOrchestratorChunkScan(job, activeSegments)
         // Catch any candidates merged by the very last chunk.
         this.enqueueNewGroups(job)
@@ -1349,50 +1348,67 @@ class Scheduler {
 
       // Update segment statuses
       for (const seg of activeSegments) {
-        const segGroups = (scan.candidateGroups || []).filter((g) => g.shortStart < seg.end && g.shortEnd > seg.start)
-        const unresolved =
-          scan.verifierEnabled === false
-            ? []
-            : segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
         const hasUnfinishedChunks = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
-        seg.status = hasUnfinishedChunks ? 'pending' : (unresolved.length > 0 ? 'verifying' : 'done')
+        seg.status = hasUnfinishedChunks ? 'pending' : 'done'
       }
       this.mark(job)
 
-      // Only stop if ALL models across ALL lanes are genuinely exhausted for today
-      const anyActiveModel = job.lanes.some((l) =>
-        CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(l.apiKey, m.id, m.rpd))
-      )
-      if (!anyActiveModel) {
-        addLog(scan, 'error', `All models across all ${job.lanes.length} API keys are exhausted for today — cannot continue chunk scan.`)
-        break
-      }
-
+      // If chunks are still pending, check if ALL models across ALL lanes are genuinely exhausted for today
       const anyRemainingPending = activeSegments.some((s) => s.chunks.some((c) => c.status === 'pending'))
-      if (!anyRemainingPending) {
-        break
+      if (anyRemainingPending) {
+        const anyActiveModel = job.lanes.some((l) =>
+          CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(l.apiKey, m.id, m.rpd))
+        )
+        if (!anyActiveModel) {
+          addLog(scan, 'error', `All models across all ${job.lanes.length} API keys are exhausted for today — cannot continue chunk scan.`)
+          break
+        }
+        // Continue to next chunk scan pass if chunks remain and models are available
+        continue
       }
 
-      // All minutes' chunk phases done (or quota-blocked) — let the verify
-      // pipeline drain fully now.
+      // =========================================================================
+      // ALL CHUNKS COMPLETE: Now run Normal Verifier followed by Rescan Phase
+      // =========================================================================
       job.seg = null
       job.chunkPhaseDone = true
-      // STOP GUARD: stop ke baad status kabhi 'stopped' se wapas 'verifying'
-      // nahi hota — warna export/preview panel phir chhup jaata.
-      if (
-        !job.stopping &&
-        scan.verifierEnabled !== false &&
-        (job.verifyQueue.length > 0 || job.verifyInFlight.size > 0)
-      ) {
+
+      // Re-synchronize and enqueue all candidate groups from chunk findings
+      this.prepareVerifyState(scan)
+      this.enqueueNewGroups(job)
+
+      const groups = scan.candidateGroups || []
+      const hasPendingVerify =
+        groups.some((g) => g.status === 'pending' || g.status === 'verifying') ||
+        job.verifyQueue.length > 0
+
+      if (!job.stopping && scan.verifierEnabled !== false && hasPendingVerify) {
         scan.status = 'verifying'
+        for (const seg of activeSegments) {
+          const segGroups = (scan.candidateGroups || []).filter((g) => g.shortStart < seg.end && g.shortEnd > seg.start)
+          if (segGroups.some((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')) {
+            seg.status = 'verifying'
+          }
+        }
+        addLog(
+          scan,
+          'info',
+          `All chunk scans complete! Starting normal candidate verification across ${job.verifyQueue.length} candidate group(s) (${job.lanes.length} API keys × ${VERIFY_MODEL_POOL.map((m) => displayModelName(m.id)).join(', ')})...`,
+        )
+        this.mark(job)
+
+        startVerifyWorkers()
+        await verifyPhase
+
+        addLog(scan, 'success', `Normal candidate verification completed.`)
         this.mark(job)
       }
-      await verifyPhase
 
       // Rescan phase: runs ONLY after ALL normal candidate verification completes.
       // Strictly uses gemini-3.5-flash and gemini-3-flash-preview ONLY.
       if (!job.stopping && scan.verifierEnabled !== false && job.rescanQueue.length > 0) {
         await this.runRescanPhase(job)
+        this.mark(job)
       }
 
       // EARLY-STOP REVIVE PASS: kisi rejected group ne skipped chunks wapas
@@ -1400,10 +1416,11 @@ class Scheduler {
       const revivedPending = segments.some(
         (s) => s.selected !== false && s.chunks.some((c) => c.status === 'pending'),
       )
-      if (job.stopping || !job.earlyStopRevived || !revivedPending) break
+      if (job.stopping || !job.earlyStopRevived || !revivedPending) {
+        break
+      }
       addLog(scan, 'warn', `Early-stop revive: rejected match ki wajah se kuch skipped chunks wapas queue me hain — extra scan pass ${pass + 2} start`)
       job.chunkPhaseDone = false
-      startVerifyWorkers()
     }
 
     // All work over. Persist final model states.
@@ -1620,13 +1637,8 @@ class Scheduler {
           // Check if this minute segment has completed all its chunks
           const hasUnfinished = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
           if (!hasUnfinished && seg.status !== 'done') {
-            const segGroups = (scan.candidateGroups || []).filter((g) => g.shortStart < seg.end && g.shortEnd > seg.start)
-            const unresolved =
-              scan.verifierEnabled === false
-                ? []
-                : segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
-            seg.status = unresolved.length > 0 ? 'verifying' : 'done'
-            addLog(scan, 'success', `Minute ${seg.index + 1}/${targetSegments.length} chunk scan complete — candidates are verifying in background.`)
+            seg.status = 'done'
+            addLog(scan, 'success', `Minute ${seg.index + 1}/${targetSegments.length} chunk scan complete (${seg.chunks.length} chunks scanned).`)
           }
 
           // Catch any candidates merged by this chunk
