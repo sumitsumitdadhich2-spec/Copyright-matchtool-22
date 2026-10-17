@@ -4,7 +4,7 @@
  * ====================================================================
  * Implements the measured 2026-10-14 testing findings:
  *   - 16 Key slots (1-13, 15, 16). Key 1 reserved. Slot 14 skipped.
- *   - Primary: gemini-3.6-flash (burst 10, continuous pipeline)
+ *   - Primary: gemini-3.6-flash (burst 4, continuous pipeline)
  *   - Secondary: gemini-3.7-flash (burst 4, avoids key 3, 10, 12)
  *   - Tertiary: gemini-3.8-flash (burst 4)
  *   - Canary: gemini-3.5-flash (probes 1/min during all-stop recovery watch)
@@ -297,6 +297,7 @@ async function main() {
 
   let completedChunks = 0
   const startTime = Date.now()
+  let initialCanaryDone = false
 
   while (completedChunks < CHUNKS_COUNT) {
     const pendingList = queue.filter((c) => c.status === 'pending')
@@ -304,49 +305,77 @@ async function main() {
       break
     }
 
-    // 1. CANARY SENTINEL: Probe 3.5 Canary (every 1 min)
-    log('ORCH', `Probing 3.5 Canary Sentinel (${CANARY_MODEL}) with "hy"...`)
-    const canaryChoke = await probeChoke(CANARY_MODEL, getChokeSlot(CANARY_MODEL))
+    // 1. CANARY SENTINEL: Probe 3.5 Canary once on initial startup or when recovering from all-stop
+    if (!initialCanaryDone) {
+      log('ORCH', `Probing 3.5 Canary Sentinel (${CANARY_MODEL}) with "hy"...`)
+      const canaryChoke = await probeChoke(CANARY_MODEL, getChokeSlot(CANARY_MODEL))
 
-    if (!canaryChoke.ok) {
-      log('ORCH', `Canary 3.5 choked (${canaryChoke.outcome}). Waiting 60s (1 min) before next 3.5 choke...`)
-      await new Promise((r) => setTimeout(r, 60_000))
-      continue
+      if (!canaryChoke.ok) {
+        log('ORCH', `Canary 3.5 choked (${canaryChoke.outcome}). Waiting 60s (1 min) before next 3.5 choke...`)
+        await new Promise((r) => setTimeout(r, 60_000))
+        continue
+      }
+
+      initialCanaryDone = true
+      log('ORCH', `Canary 3.5 SUCCEEDED (reply: "${canaryChoke.reply}"). Proceeding directly to Primary 3.6...`)
     }
 
-    log('ORCH', `Canary 3.5 SUCCEEDED (reply: "${canaryChoke.reply}"). Immediately probing Primary 3.6...`)
+    let primaryRan = false
+    let secondaryRan = false
+    let tertiaryRan = false
 
-    // 2. PRIMARY: Probe 3.6
+    // 2. PRIMARY: Probe 3.6 & burst 4 requests
     log('ORCH', `Probing Primary Model (${PRIMARY_MODEL}) with "hy"...`)
     const primaryChoke = await probeChoke(PRIMARY_MODEL, getChokeSlot(PRIMARY_MODEL))
 
     if (primaryChoke.ok) {
-      log('ORCH', `Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 10 burst requests within 3s (3.5 choke is OFF during burst)...`)
-      await launchBurst(PRIMARY_MODEL, 10)
-      continue
+      log('ORCH', `Primary 3.6 confirmed (reply: "${primaryChoke.reply}"). Launching 4 burst requests within 3s...`)
+      await launchBurst(PRIMARY_MODEL, 4)
+      primaryRan = true
+      log('ORCH', `Primary 3.6 completed burst of 4 requests. 3.5 will NOT trigger — proceeding directly to Secondary 3.7 choke...`)
+    } else {
+      log('ORCH', `Primary 3.6 choked (${primaryChoke.error || '503'}). Immediate failover to Secondary (${SECONDARY_MODEL})...`)
     }
 
-    // 3. 503 on 3.6 -> Immediately Probe 3.7
-    log('ORCH', `Primary 3.6 choked (${primaryChoke.error || '503'}). Immediate failover to Secondary (${SECONDARY_MODEL})...`)
+    if (completedChunks >= CHUNKS_COUNT) break
+
+    // 3. SECONDARY: Probe 3.7 & burst 4 requests
+    log('ORCH', `Probing Secondary Model (${SECONDARY_MODEL}) with "hy"...`)
     const secChoke = await probeChoke(SECONDARY_MODEL, getChokeSlot(SECONDARY_MODEL))
 
     if (secChoke.ok) {
-      log('ORCH', `Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests within 3s (3.5 choke is OFF during burst)...`)
+      log('ORCH', `Secondary 3.7 confirmed (reply: "${secChoke.reply}"). Launching 4 burst requests within 3s...`)
       await launchBurst(SECONDARY_MODEL, 4)
-      continue
+      secondaryRan = true
+      log('ORCH', `Secondary 3.7 completed burst of 4 requests. Proceeding directly to Tertiary 3.8 choke...`)
+    } else {
+      log('ORCH', `Secondary 3.7 choked (${secChoke.error || '503'}). Immediate failover to Tertiary (${TERTIARY_MODEL})...`)
     }
 
-    // 4. 503 on 3.7 -> Probe 3.8
-    log('ORCH', `Secondary 3.7 choked (${secChoke.error || '503'}). Attempting Tertiary (${TERTIARY_MODEL})...`)
+    if (completedChunks >= CHUNKS_COUNT) break
+
+    // 4. TERTIARY: Probe 3.8 & burst 4 requests
+    log('ORCH', `Probing Tertiary Model (${TERTIARY_MODEL}) with "hy"...`)
     const tertChoke = await probeChoke(TERTIARY_MODEL, getChokeSlot(TERTIARY_MODEL))
 
     if (tertChoke.ok) {
-      log('ORCH', `Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests within 3s (3.5 choke is OFF during burst)...`)
+      log('ORCH', `Tertiary 3.8 confirmed (reply: "${tertChoke.reply}"). Launching 4 burst requests within 3s...`)
       await launchBurst(TERTIARY_MODEL, 4)
+      tertiaryRan = true
+      log('ORCH', `Tertiary 3.8 completed burst of 4 requests. Round complete. Returning directly to Primary 3.6 (3.5 will NOT trigger)...`)
+    } else {
+      log('ORCH', `Tertiary 3.8 choked (${tertChoke.error || '503'}).`)
+    }
+
+    if (completedChunks >= CHUNKS_COUNT) break
+
+    // If at least one worker model was able to run in this round, loop back directly to Primary 3.6 (3.5 will NOT trigger)!
+    if (primaryRan || secondaryRan || tertiaryRan) {
       continue
     }
 
     // 5. ALL STOP -> Unlimited Wait (resuming 3.5 1-min choke loop)
+    initialCanaryDone = false
     log('ORCH', `ALL MODELS ARE IN 503 / HIGH DEMAND! Entering UNLIMITED WAIT — resuming 3.5 Flash 1-min loop...`)
     await new Promise((r) => setTimeout(r, 60_000))
   }

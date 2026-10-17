@@ -76,7 +76,7 @@ export function OrchestratorMatrixPanel() {
               </span>
             </div>
             <p className="text-xs text-muted-foreground">
-              3.5 Sentinel (1-min loop) • Primary 3.6 (Burst 10) • Secondary 3.7 (Burst 4) • Tertiary 3.8 (Burst 4) • Instant &lt;3s Dispatch
+              3.5 Sentinel (1-min loop) • Primary 3.6 (Burst 4) • Secondary 3.7 (Burst 4) • Tertiary 3.8 (Burst 4) • Instant &lt;3s Dispatch
             </p>
           </div>
         </div>
@@ -310,14 +310,14 @@ export function OrchestratorMatrixPanel() {
               <div className="flex items-center justify-between">
                 <span className="font-mono text-xs font-bold text-emerald-300">gemini-3.6-flash</span>
                 <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold text-emerald-300">
-                  PRIMARY (Burst 10)
+                  PRIMARY (Burst 4)
                 </span>
               </div>
               <p className="mt-1 text-xs text-muted-foreground">Most stable worker • Continuous pipeline • 20 RPD</p>
               <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
                 <div className="rounded bg-background/60 p-2">
                   <span className="text-[10px] text-muted-foreground">Max Parallelism</span>
-                  <p className="font-mono font-bold text-foreground">10 parallel</p>
+                  <p className="font-mono font-bold text-foreground">4 parallel</p>
                 </div>
                 <div className="rounded bg-background/60 p-2">
                   <span className="text-[10px] text-muted-foreground">Window Post-Choke</span>

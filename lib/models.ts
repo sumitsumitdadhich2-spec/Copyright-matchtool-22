@@ -38,12 +38,12 @@ export const ORCHESTRATOR_CHOKE_TIMEOUT_MS = 120_000
 
 /** Max parallel chunk workers per model tier */
 export const ORCHESTRATOR_BURST_MAX: Record<string, number> = {
-  [ORCHESTRATOR_PRIMARY_MODEL]: 10,
+  [ORCHESTRATOR_PRIMARY_MODEL]: 4,
   [ORCHESTRATOR_SECONDARY_MODEL]: 4,
   [ORCHESTRATOR_TERTIARY_MODEL]: 4,
 }
 
-/** Stagger between chunk launches in a burst: 200ms so all 10 requests launch within 2-3 seconds */
+/** Stagger between chunk launches in a burst: 200ms so all 4 requests launch within 2-3 seconds */
 export const ORCHESTRATOR_BURST_STAGGER_MS = 200
 
 /** VERIFY models (locked): gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY.

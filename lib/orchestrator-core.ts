@@ -79,6 +79,8 @@ export class ChunkScanOrchestrator {
   private keyModelCooldown = new Map<string, number>()
   /** Per-model cooldown timestamp (1 min cooldown when burst encounters 503 high demand) */
   private modelCooldownUntil = new Map<string, number>()
+  /** Sentinel flag: 3.5 canary probe only runs on initial scan start or all-model recovery */
+  private initialCanaryDone = false
 
   private state: OrchestratorLiveState = this.createInitialState()
 
@@ -124,7 +126,7 @@ export class ChunkScanOrchestrator {
         modelId: ORCHESTRATOR_PRIMARY_MODEL,
         role: 'primary',
         status: this.droppedModelsToday?.has(ORCHESTRATOR_PRIMARY_MODEL) ? 'exhausted' : 'healthy',
-        effectiveParallelism: this.droppedModelsToday?.has(ORCHESTRATOR_PRIMARY_MODEL) ? 0 : (ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_PRIMARY_MODEL] || 10),
+        effectiveParallelism: this.droppedModelsToday?.has(ORCHESTRATOR_PRIMARY_MODEL) ? 0 : (ORCHESTRATOR_BURST_MAX[ORCHESTRATOR_PRIMARY_MODEL] || 4),
         total503: 0,
         total429: 0,
         totalTimeouts: 0,
@@ -263,6 +265,18 @@ export class ChunkScanOrchestrator {
     this.state.queue = { pending, assigned, processing, done, failed, retrying }
   }
 
+  public hasUnfinishedChunks(): boolean {
+    this.refreshQueueCounts()
+    return this.chunkQueue.some(
+      (c) =>
+        c.status === 'pending' ||
+        c.status === 'assigned' ||
+        c.status === 'processing' ||
+        c.status === 'failed' ||
+        c.status === 'parked',
+    )
+  }
+
   /**
    * Load chunks into queue and prepare orchestrator.
    * Supports chunk index numbers or item objects with prior attempts and error details.
@@ -274,6 +288,7 @@ export class ChunkScanOrchestrator {
     this.activeScanId = scanId
     this.stopping = false
     this.pauseRequested = false
+    this.initialCanaryDone = false
     this.lastAllModelsChokeTime = Date.now()
     this.initSlots()
 
@@ -730,15 +745,14 @@ export class ChunkScanOrchestrator {
 
   /**
    * Main Orchestrator Loop:
-   * 1. 3.5 Flash sentinel choke (probes every 1 min).
-   * 2. If 3.5 succeeds -> immediately choke 3.6 Primary.
-   * 3. If 3.6 succeeds -> launch 10 burst requests immediately (<3s).
-   *    (While 3.6/3.7/3.8 burst is running, the 3.5 1-min choke loop is OFF).
-   * 4. If 3.6 fails (503) -> immediately choke 3.7 Secondary.
-   * 5. If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
-   * 6. If 3.7 fails (503) -> immediately choke 3.8 Tertiary.
-   * 7. If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
-   * 8. If 3.8 fails (503) -> UNLIMITED WAIT (3.5 Flash 1-min choke loop restarts).
+   * 1. 3.5 Flash sentinel choke (probes once on initial startup or when all worker models fail).
+   * 2. If 3.6 succeeds -> launch 4 burst requests immediately (<3s).
+   * 3. After 3.6 burst completes -> 3.5 will NOT trigger! Proceed directly to 3.7 Secondary choke.
+   * 4. If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
+   * 5. After 3.7 burst completes -> proceed directly to 3.8 Tertiary choke.
+   * 6. If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
+   * 7. After 3.8 burst completes -> return directly to 3.6 Primary (3.5 will NOT trigger).
+   * 8. If all worker models (3.6, 3.7, 3.8) fail (503 / dropped) -> UNLIMITED WAIT (3.5 Flash 1-min choke loop restarts).
    */
   public async runOrchestrationLoop(): Promise<void> {
     this.stopping = false
@@ -751,11 +765,7 @@ export class ChunkScanOrchestrator {
         continue
       }
 
-      this.refreshQueueCounts()
-      const hasUnfinishedChunks = this.chunkQueue.some(
-        (c) => c.status === 'pending' || c.status === 'assigned' || c.status === 'processing' || c.status === 'failed' || c.status === 'parked',
-      )
-      if (!hasUnfinishedChunks) {
+      if (!this.hasUnfinishedChunks()) {
         this.state.phase = 'completed'
         this.log({
           timestamp: Date.now(),
@@ -766,55 +776,72 @@ export class ChunkScanOrchestrator {
       }
 
       // ==============================================================
-      // STEP 1: 3.5 FLASH SENTINEL CHOKE (1-min loop)
+      // STEP 1: 3.5 FLASH SENTINEL CHOKE (Initial start or Recovery only)
       // Probes gemini-3.5-flash with message "hy".
-      // If 3.5 fails: wait 60s (1 min) and re-probe 3.5.
+      // User rule: Once started, 3.5 will NOT trigger after 3.6 burst;
+      // instead, 3.7 choke triggers directly.
+      // 3.5 only probes here on initial startup or when recovering from all-models-down.
       // ==============================================================
-      this.state.phase = 'choke_canary'
-      this.state.activeModel = ORCHESTRATOR_CANARY_MODEL
-      this.state.canaryActive = true
-      this.log({
-        timestamp: Date.now(),
-        type: 'choke',
-        model: ORCHESTRATOR_CANARY_MODEL,
-        message: `Phase [choke_canary]: Probing 3.5 Flash sentinel (${ORCHESTRATOR_CANARY_MODEL}) with "hy"...`,
-      })
-
-      const canaryChoke = await this.probeChoke(ORCHESTRATOR_CANARY_MODEL)
-
-      if (!canaryChoke.ok) {
+      if (!this.initialCanaryDone) {
+        this.state.phase = 'choke_canary'
+        this.state.activeModel = ORCHESTRATOR_CANARY_MODEL
+        this.state.canaryActive = true
         this.log({
           timestamp: Date.now(),
-          type: 'warn',
+          type: 'choke',
           model: ORCHESTRATOR_CANARY_MODEL,
-          message: `Canary 3.5 choke failed (${canaryChoke.error || '503 Overload'}). Waiting 60s (1 min) before next 3.5 choke...`,
+          message: `Phase [choke_canary]: Probing initial 3.5 Flash sentinel (${ORCHESTRATOR_CANARY_MODEL}) with "hy"...`,
         })
-        await this.sleepWithInterrupt(60_000)
-        continue
+
+        const canaryChoke = await this.probeChoke(ORCHESTRATOR_CANARY_MODEL)
+
+        if (!canaryChoke.ok) {
+          this.log({
+            timestamp: Date.now(),
+            type: 'warn',
+            model: ORCHESTRATOR_CANARY_MODEL,
+            message: `Canary 3.5 choke failed (${canaryChoke.error || '503 Overload'}). Waiting 60s (1 min) before next 3.5 choke...`,
+          })
+          await this.sleepWithInterrupt(60_000)
+          continue
+        }
+
+        this.initialCanaryDone = true
+        this.state.canaryActive = false
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_CANARY_MODEL,
+          message: `Canary 3.5 choke SUCCEEDED (reply: "${canaryChoke.reply}"). Proceeding directly to Primary 3.6...`,
+        })
       }
 
-      this.state.canaryActive = false
-      this.log({
-        timestamp: Date.now(),
-        type: 'info',
-        model: ORCHESTRATOR_CANARY_MODEL,
-        message: `Canary 3.5 choke SUCCEEDED (reply: "${canaryChoke.reply}"). Immediately probing Primary 3.6...`,
-      })
+      if (this.stopping) break
+      if (!this.hasUnfinishedChunks()) {
+        this.state.phase = 'completed'
+        break
+      }
 
       // ==============================================================
-      // STEP 2: PRIMARY 3.6 CHOKE PROBE
+      // STEP 2: PRIMARY 3.6 CHOKE PROBE & BURST (4 requests)
       // Probes gemini-3.6-flash with message "hy".
-      // If 3.6 succeeds -> clear cooldown and launch 10 burst requests immediately (<3s).
-      // (3.5 1-min choke is OFF while 3.6 burst is running).
-      // User rule: When 3.5 canary succeeds, ALWAYS send 1 choke probe to 3.6
-      // to check if 3.6 is out of 503 overload or not!
+      // If 3.6 succeeds -> launch 4 burst requests immediately (<3s).
+      // After 4 requests complete -> DO NOT trigger 3.5! Proceed directly to 3.7 choke!
       // ==============================================================
+      let primaryRan = false
       if (this.isModelDroppedToday(ORCHESTRATOR_PRIMARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_PRIMARY_MODEL,
           message: `Primary 3.6 is DROPPED for today (429 RPD Quota Exceeded). Skipping 3.6 directly to Secondary 3.7...`,
+        })
+      } else if (this.isModelInCooldown(ORCHESTRATOR_PRIMARY_MODEL)) {
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_PRIMARY_MODEL,
+          message: `Primary 3.6 is in 503 cooldown. Proceeding directly to Secondary 3.7 choke...`,
         })
       } else {
         this.state.phase = 'choke_primary'
@@ -835,21 +862,25 @@ export class ChunkScanOrchestrator {
             timestamp: Date.now(),
             type: 'info',
             model: ORCHESTRATOR_PRIMARY_MODEL,
-            message: `Phase [burst_primary]: Primary 3.6 confirmed out of 503 overload (reply: "${primaryChoke.reply}"). Launching 10 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+            message: `Phase [burst_primary]: Primary 3.6 confirmed out of 503 overload (reply: "${primaryChoke.reply}"). Launching 4 burst requests immediately within 3s...`,
           })
-          const burstResult = await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 10)
+          const burstResult = await this.executeBurst(ORCHESTRATOR_PRIMARY_MODEL, 4)
+          primaryRan = burstResult.launched > 0
+
           if (burstResult.successes > 0) {
-            continue
+            this.log({
+              timestamp: Date.now(),
+              type: 'info',
+              model: ORCHESTRATOR_PRIMARY_MODEL,
+              message: `Primary 3.6 completed 4 burst requests (${burstResult.successes} successful). 3.5 will NOT trigger — proceeding directly to Secondary 3.7 choke...`,
+            })
           } else if (burstResult.errors503 > 0) {
             this.log({
               timestamp: Date.now(),
               type: 'failover',
               model: ORCHESTRATOR_PRIMARY_MODEL,
-              message: `Primary 3.6 burst failed with 503 High Demand across chunks. Immediately failing over to Secondary 3.7...`,
+              message: `Primary 3.6 burst failed with 503 High Demand across chunks. Immediately failing over to Secondary 3.7 choke...`,
             })
-            // Fall through to Step 3 (Secondary 3.7)
-          } else {
-            continue
           }
         } else {
           this.log({
@@ -861,18 +892,32 @@ export class ChunkScanOrchestrator {
         }
       }
 
+      if (this.stopping) break
+      if (!this.hasUnfinishedChunks()) {
+        this.state.phase = 'completed'
+        break
+      }
+
       // ==============================================================
-      // STEP 3: SECONDARY 3.7 CHOKE PROBE (on 3.6 failure, dropped, or 503)
+      // STEP 3: SECONDARY 3.7 CHOKE PROBE & BURST (4 requests)
       // Probes gemini-3.7-flash with message "hy".
-      // If 3.7 succeeds -> clear cooldown and launch 4 burst requests immediately (<3s).
-      // (3.5 1-min choke is OFF while 3.7 burst is running).
+      // If 3.7 succeeds -> launch 4 burst requests immediately (<3s).
+      // After 4 requests complete -> proceed directly to Tertiary 3.8 choke!
       // ==============================================================
+      let secondaryRan = false
       if (this.isModelDroppedToday(ORCHESTRATOR_SECONDARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_SECONDARY_MODEL,
           message: `Secondary 3.7 is DROPPED for today (429 RPD Quota Exceeded). Skipping 3.7 directly to Tertiary 3.8...`,
+        })
+      } else if (this.isModelInCooldown(ORCHESTRATOR_SECONDARY_MODEL)) {
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_SECONDARY_MODEL,
+          message: `Secondary 3.7 is in 503 cooldown. Proceeding to Tertiary 3.8 choke...`,
         })
       } else {
         this.state.phase = 'choke_secondary'
@@ -893,21 +938,25 @@ export class ChunkScanOrchestrator {
             timestamp: Date.now(),
             type: 'info',
             model: ORCHESTRATOR_SECONDARY_MODEL,
-            message: `Phase [burst_secondary]: Secondary 3.7 confirmed out of 503 overload (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+            message: `Phase [burst_secondary]: Secondary 3.7 confirmed out of 503 overload (reply: "${secChoke.reply}"). Launching 4 burst requests immediately within 3s...`,
           })
           const burstResult = await this.executeBurst(ORCHESTRATOR_SECONDARY_MODEL, 4)
+          secondaryRan = burstResult.launched > 0
+
           if (burstResult.successes > 0) {
-            continue
+            this.log({
+              timestamp: Date.now(),
+              type: 'info',
+              model: ORCHESTRATOR_SECONDARY_MODEL,
+              message: `Secondary 3.7 completed 4 burst requests (${burstResult.successes} successful). Proceeding to Tertiary 3.8 choke...`,
+            })
           } else if (burstResult.errors503 > 0) {
             this.log({
               timestamp: Date.now(),
               type: 'failover',
               model: ORCHESTRATOR_SECONDARY_MODEL,
-              message: `Secondary 3.7 burst failed with 503 High Demand across chunks. Immediately failing over to Tertiary 3.8...`,
+              message: `Secondary 3.7 burst failed with 503 High Demand across chunks. Immediately failing over to Tertiary 3.8 choke...`,
             })
-            // Fall through to Step 4 (Tertiary 3.8)
-          } else {
-            continue
           }
         } else {
           this.log({
@@ -919,18 +968,32 @@ export class ChunkScanOrchestrator {
         }
       }
 
+      if (this.stopping) break
+      if (!this.hasUnfinishedChunks()) {
+        this.state.phase = 'completed'
+        break
+      }
+
       // ==============================================================
-      // STEP 4: TERTIARY 3.8 CHOKE PROBE (on 3.7 failure, dropped, or 503)
+      // STEP 4: TERTIARY 3.8 CHOKE PROBE & BURST (4 requests)
       // Probes gemini-3.8-flash with message "hy".
-      // If 3.8 succeeds -> clear cooldown and launch 4 burst requests immediately (<3s).
-      // (3.5 1-min choke is OFF while 3.8 burst is running).
+      // If 3.8 succeeds -> launch 4 burst requests immediately (<3s).
+      // After 4 requests complete -> round returns directly to Primary 3.6 (3.5 will NOT trigger)!
       // ==============================================================
+      let tertiaryRan = false
       if (this.isModelDroppedToday(ORCHESTRATOR_TERTIARY_MODEL)) {
         this.log({
           timestamp: Date.now(),
           type: 'info',
           model: ORCHESTRATOR_TERTIARY_MODEL,
           message: `Tertiary 3.8 is DROPPED for today (429 RPD Quota Exceeded). All worker models exhausted.`,
+        })
+      } else if (this.isModelInCooldown(ORCHESTRATOR_TERTIARY_MODEL)) {
+        this.log({
+          timestamp: Date.now(),
+          type: 'info',
+          model: ORCHESTRATOR_TERTIARY_MODEL,
+          message: `Tertiary 3.8 is in 503 cooldown.`,
         })
       } else {
         this.state.phase = 'choke_tertiary'
@@ -951,11 +1014,18 @@ export class ChunkScanOrchestrator {
             timestamp: Date.now(),
             type: 'info',
             model: ORCHESTRATOR_TERTIARY_MODEL,
-            message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed out of 503 overload (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s (3.5 choke is OFF during burst)...`,
+            message: `Phase [burst_tertiary]: Tertiary 3.8 confirmed out of 503 overload (reply: "${tertChoke.reply}"). Launching 4 burst requests immediately within 3s...`,
           })
           const burstResult = await this.executeBurst(ORCHESTRATOR_TERTIARY_MODEL, 4)
+          tertiaryRan = burstResult.launched > 0
+
           if (burstResult.successes > 0) {
-            continue
+            this.log({
+              timestamp: Date.now(),
+              type: 'info',
+              model: ORCHESTRATOR_TERTIARY_MODEL,
+              message: `Tertiary 3.8 completed 4 burst requests (${burstResult.successes} successful). Round completed. Returning directly to Primary 3.6 (3.5 will NOT trigger)...`,
+            })
           } else if (burstResult.errors503 > 0) {
             this.log({
               timestamp: Date.now(),
@@ -963,9 +1033,6 @@ export class ChunkScanOrchestrator {
               model: ORCHESTRATOR_TERTIARY_MODEL,
               message: `Tertiary 3.8 burst failed with 503 High Demand across chunks. All worker models in 503 overload.`,
             })
-            // Fall through to Step 5
-          } else {
-            continue
           }
         } else {
           this.log({
@@ -977,10 +1044,17 @@ export class ChunkScanOrchestrator {
         }
       }
 
+      // If at least one worker model was able to run during this cycle,
+      // loop back to Step 2 (Primary 3.6) directly! 3.5 will NOT trigger!
+      if (primaryRan || secondaryRan || tertiaryRan) {
+        continue
+      }
+
       // ==============================================================
       // STEP 5: UNLIMITED WAIT (All available worker models failed with 503 or dropped)
       // Resumes 3.5 Flash 1-min choke loop.
       // ==============================================================
+      this.initialCanaryDone = false
       const allDropped =
         this.isModelDroppedToday(ORCHESTRATOR_PRIMARY_MODEL) &&
         this.isModelDroppedToday(ORCHESTRATOR_SECONDARY_MODEL) &&
@@ -1003,7 +1077,7 @@ export class ChunkScanOrchestrator {
 
   /**
    * Execute Burst on a given model:
-   * - Parallelism: 10 on 3.6, 4 on 3.7, 4 on 3.8.
+   * - Parallelism: 4 on 3.6, 4 on 3.7, 4 on 3.8.
    * - IMMEDIATE LAUNCH: all requests dispatched within 3 seconds (<200ms stagger between worker starts).
    * - While burst is executing, 3.5 1-min choke is OFF.
    * - If any chunk encounters 503:
@@ -1013,7 +1087,7 @@ export class ChunkScanOrchestrator {
     model: string,
     burstCountOverride?: number,
   ): Promise<{ launched: number; successes: number; errors503: number; errors429: number; timeouts: number }> {
-    const defaultMax = model === ORCHESTRATOR_PRIMARY_MODEL ? 10 : 4
+    const defaultMax = 4
     const maxParallel = burstCountOverride || ORCHESTRATOR_BURST_MAX[model] || defaultMax
 
     // Reset failed/parked chunks back to pending so they are retried first in this cycle
@@ -1080,9 +1154,9 @@ export class ChunkScanOrchestrator {
     const slotsToUse = rotatedSlots.slice(0, maxParallel)
 
     // RAPID LAUNCH: all burst requests must be dispatched within 3 seconds!
-    // Stagger is 150-200ms per slot so all 10 requests fire within 2.0 seconds.
+    // Stagger is 150-200ms per slot so all 4 requests fire within 1.0 second.
     const launchStaggerMs = slotsToUse.length > 1
-      ? Math.min(200, Math.floor(2200 / slotsToUse.length))
+      ? Math.min(200, Math.floor(1500 / slotsToUse.length))
       : 0
 
     this.log({
@@ -1110,30 +1184,26 @@ export class ChunkScanOrchestrator {
       if (this.stopping) break
 
       const slotTask = (async () => {
-        while (!this.stopping && !this.pauseRequested) {
-          const nextChunk = this.getNextChunkForAssignment(slot, model)
-          if (!nextChunk) break
+        if (this.stopping || this.pauseRequested) return
+        const nextChunk = this.getNextChunkForAssignment(slot, model)
+        if (!nextChunk) return
 
-          const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
-          if (outcome === 'success') {
-            totalSuccesses++
-          } else if (outcome === '503') {
-            total503++
-            this.log({
-              timestamp: Date.now(),
-              type: 'warn',
-              model,
-              keySlot: slot,
-              message: `503 High Demand on Key ${slot} — 1-minute cooldown applied to Key ${slot} for ${model} (TPM safety). Chunk #${nextChunk.index} queued for next cycle.`,
-            })
-            break
-          } else if (outcome === '429') {
-            total429++
-            break
-          } else {
-            totalTimeouts++
-            break
-          }
+        const outcome = await this.processChunkOnSlot(nextChunk, slot, model)
+        if (outcome === 'success') {
+          totalSuccesses++
+        } else if (outcome === '503') {
+          total503++
+          this.log({
+            timestamp: Date.now(),
+            type: 'warn',
+            model,
+            keySlot: slot,
+            message: `503 High Demand on Key ${slot} — 1-minute cooldown applied to Key ${slot} for ${model} (TPM safety). Chunk #${nextChunk.index} queued for next cycle.`,
+          })
+        } else if (outcome === '429') {
+          total429++
+        } else {
+          totalTimeouts++
         }
       })()
 
@@ -1446,6 +1516,7 @@ export class ChunkScanOrchestrator {
   public reset() {
     this.stopping = false
     this.pauseRequested = false
+    this.initialCanaryDone = false
     this.chunkQueue = []
     this.state = this.createInitialState()
   }
