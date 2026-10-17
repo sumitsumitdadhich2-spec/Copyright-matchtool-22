@@ -318,14 +318,30 @@ class Scheduler {
     const pendingChunks = selectedSegs.reduce((n, s) => n + s.chunks.filter((c) => c.status === 'pending').length, 0)
     const allSettled = selectedSegs.every((s) => s.chunks.every((c) => c.status !== 'pending' && c.status !== 'scanning'))
 
+    const isScanResuming =
+      Boolean(resume) ||
+      Boolean(scan.background?.resume) ||
+      scan.status === 'stopped' ||
+      scan.status === 'error' ||
+      scan.status === 'done' ||
+      (scan.status as string) === 'completed' ||
+      (scan.shortSegments?.some((s) => s.chunks.some((c) => c.status === 'done' || c.status === 'parked')) ?? false) ||
+      (scan.chunks?.some((c) => c.status === 'done' || c.status === 'parked') ?? false)
+
+    if (isScanResuming) {
+      this.prepareVerifyState(scan)
+    }
+
     // Verification-only resume: all chunks already mapped but candidate groups
-    // still have pending verifier/rescan work (or matches were never verified).
+    // still have pending/unverified verifier/rescan work (or matches were never verified).
     const hasVerifyWork =
-      (scan.candidateGroups || []).some((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning') ||
-      (scan.matches || []).some((m) => m.verified === undefined) ||
+      (scan.candidateGroups || []).some(
+        (g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning' || g.status === 'unverified',
+      ) ||
+      (scan.matches || []).some((m) => m.verified === undefined || (m.verified === false && !m.rejected && !m.userPick)) ||
       (!scan.candidateGroups?.length && (scan.matches || []).length > 0 && allSettled)
 
-    if (pendingChunks === 0 && !hasVerifyWork) return { ok: false, error: 'No pending chunks to scan.' }
+    if (pendingChunks === 0 && !hasVerifyWork) return { ok: false, error: 'No pending chunks or unverified candidates to scan.' }
 
     // Mirror the first incomplete SELECTED segment's chunks so the UI shows the right minute.
     const firstIncomplete = selectedSegs.find((s) => s.status !== 'done') || selectedSegs[0] || segments[0]
@@ -347,7 +363,7 @@ class Scheduler {
     }
 
     if (!Array.isArray(scan.matches)) scan.matches = []
-    scan.status = 'scanning'
+    scan.status = pendingChunks === 0 ? 'verifying' : 'scanning'
     scan.error = null
     if (!scan.startedAt) scan.startedAt = Date.now()
 
@@ -399,20 +415,14 @@ class Scheduler {
       }
     }
 
-    const isScanResuming =
-      Boolean(resume) ||
-      Boolean(scan.background?.resume) ||
-      scan.status === 'stopped' ||
-      scan.status === 'error' ||
-      (scan.shortSegments?.some((s) => s.chunks.some((c) => c.status === 'done' || c.status === 'parked')) ?? false) ||
-      (scan.chunks?.some((c) => c.status === 'done' || c.status === 'parked') ?? false)
-
     const minuteNote = segments.length > 1 ? ` across ${segments.length} short minutes (scanned sequentially)` : ''
     addLog(
       scan,
       'info',
       isScanResuming
-        ? `Resuming scan: ${pendingChunks} chunk(s) pending${minuteNote} via OrchestratorCore (choke→burst pipeline)`
+        ? (pendingChunks === 0
+            ? `Resuming verification: all chunks mapped, verifying/rescanning remaining candidate groups across ${lanes.length} API key(s)`
+            : `Resuming scan: ${pendingChunks} chunk(s) pending${minuteNote} via OrchestratorCore (choke→burst pipeline)`)
         : `Scan started: ${pendingChunks} chunk(s) queued${minuteNote} across ${CHUNK_MODEL_POOL.length} chunk models (${CHUNK_MODEL_POOL.map((m) => m.id).join(', ')}) × ${lanes.length} API key(s) — one prompt per chunk`,
     )
 
@@ -1766,14 +1776,31 @@ class Scheduler {
     }
   }
 
-  /** Reset transient candidate-group states left over from an interrupted run. */
+  /** Reset transient candidate-group states left over from an interrupted run,
+   *  and revive unverified candidate groups so that Resume can re-verify and rescan them! */
   private prepareVerifyState(scan: Scan) {
     for (const g of scan.candidateGroups || []) {
-      if (g.status === 'verifying' || g.status === 'rescanning') g.status = 'pending'
-      for (const c of g.candidates) {
-        if (c.verdict === 'verifying') c.verdict = 'pending'
-        if (c.rescan === 'rescanning') c.rescan = 'pending'
-        if (c.rescanVerdict === 'verifying') c.rescanVerdict = 'pending'
+      // User manual picks and confirmed groups are preserved!
+      if (g.userPick || g.status === 'confirmed') continue
+
+      if (g.status === 'verifying' || g.status === 'rescanning' || g.status === 'unverified') {
+        g.status = 'pending'
+        g.attempts = 0
+        g.confirmedIndex = null
+        g.confirmedViaRescan = false
+        delete g.superseded
+        for (const c of g.candidates) {
+          if (c.verdict !== 'same') {
+            c.verdict = 'pending'
+            delete c.verifierModel
+            delete c.verifierReason
+            c.rescan = 'none'
+            delete c.rescanMovieStart
+            delete c.rescanMovieEnd
+            delete c.rescanVerdict
+            delete c.rescanReason
+          }
+        }
       }
     }
   }

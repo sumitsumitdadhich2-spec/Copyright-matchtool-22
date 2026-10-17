@@ -91,6 +91,18 @@ export function Dashboard() {
   // Scan is BLOCKED when a normal user's tokens are exhausted (admin is unlimited).
   const scanBlocked = user.role !== 'admin' && exhausted
   const canStart = Boolean(scan && !running && !queued && status === 'ready' && scan.chunkCount > 0 && !scanBlocked)
+
+  // Unverified candidate groups or unverified matches that need verification/rescan
+  const hasUnverifiedWork = Boolean(
+    scan &&
+      ((scan.candidateGroups || []).some(
+        (g) => g.status === 'unverified' || g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning',
+      ) ||
+        (scan.matches || []).some(
+          (m) => m.verified === undefined || (m.verified === false && !m.rejected && !m.userPick),
+        )),
+  )
+
   // Segments-aware: any incomplete minute (or any resumable chunk inside one) allows Resume.
   const hasResumableWork = Boolean(
     scan &&
@@ -103,7 +115,12 @@ export function Dashboard() {
         : (scan.chunks || []).some((c) => c.status === 'pending' || c.status === 'scanning' || c.status === 'cancelled')),
   )
   const canResume = Boolean(
-    scan && !running && !queued && (status === 'stopped' || ((status === 'error' || status === 'scanning') && hasResumableWork)),
+    scan &&
+      !running &&
+      !queued &&
+      (status === 'stopped' ||
+        ((status === 'error' || status === 'scanning') && (hasResumableWork || hasUnverifiedWork)) ||
+        ((status === 'done' || (status as string) === 'completed') && (hasResumableWork || hasUnverifiedWork))),
   )
   // Stop dab chuka hai lekin in-flight requests background me settle ho rahi hain —
   // partial results/export TURANT available hain, dobara Stop ki zaroorat nahi.
@@ -466,26 +483,58 @@ export function Dashboard() {
         </div>
       )}
 
-      {scan && status === 'completed' && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3.5 text-emerald-200 shadow-md">
+      {scan && (status === 'completed' || status === 'done') && (
+        <div
+          className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border p-3.5 shadow-md ${
+            hasUnverifiedWork
+              ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+              : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+          }`}
+        >
           <div className="flex items-center gap-2.5">
-            <CheckCircle2 className="size-5 shrink-0 text-emerald-400" />
+            {hasUnverifiedWork ? (
+              <AlertTriangle className="size-5 shrink-0 text-amber-400" />
+            ) : (
+              <CheckCircle2 className="size-5 shrink-0 text-emerald-400" />
+            )}
             <div>
-              <p className="text-sm font-semibold text-emerald-200">Scan Completed Successfully!</p>
-              <p className="text-xs text-emerald-300/80">
-                All candidate verification and rescans finished ({scan.candidateGroups?.filter((g) => g.status === 'confirmed').length || 0} confirmed matches). Download complete session diagnostic logs.
+              <p className={`text-sm font-semibold ${hasUnverifiedWork ? 'text-amber-200' : 'text-emerald-200'}`}>
+                {hasUnverifiedWork
+                  ? `Scan Finished with ${scan.candidateGroups?.filter((g) => g.status === 'unverified').length || 'some'} Unverified Candidate(s)`
+                  : 'Scan Completed Successfully!'}
+              </p>
+              <p className={`text-xs ${hasUnverifiedWork ? 'text-amber-300/80' : 'text-emerald-300/80'}`}>
+                {hasUnverifiedWork
+                  ? 'Unverified candidates ko normal verifier aur rescan se re-verify karne ke liye Resume dabayein.'
+                  : `All candidate verification and rescans finished (${scan.candidateGroups?.filter((g) => g.status === 'confirmed').length || 0} confirmed matches). Download complete session diagnostic logs.`}
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={handleDownloadLogsPdf}
-            disabled={downloadingLogsPdf || (scan.logs?.length ?? 0) === 0}
-            className="btn-press flex items-center gap-1.5 rounded-lg bg-emerald-500 text-emerald-950 font-bold px-3.5 py-1.5 text-xs hover:bg-emerald-400 transition-all shadow-sm"
-          >
-            {downloadingLogsPdf ? <Loader2 className="size-3.5 animate-spin" /> : <FileDown className="size-3.5" />}
-            Download Logs PDF ({scan.logs?.length || 0} logs)
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleDownloadLogsPdf}
+              disabled={downloadingLogsPdf || (scan.logs?.length ?? 0) === 0}
+              className={`btn-press flex items-center gap-1.5 rounded-lg font-bold px-3.5 py-1.5 text-xs transition-all shadow-sm ${
+                hasUnverifiedWork
+                  ? 'bg-amber-500 text-amber-950 hover:bg-amber-400'
+                  : 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400'
+              }`}
+            >
+              {downloadingLogsPdf ? <Loader2 className="size-3.5 animate-spin" /> : <FileDown className="size-3.5" />}
+              Download Logs PDF ({scan.logs?.length || 0} logs)
+            </button>
+            {canResume && (
+              <button
+                type="button"
+                onClick={() => action('start', { resume: true })}
+                disabled={busy}
+                className="btn-press flex items-center gap-1.5 rounded-lg border border-amber-400/50 bg-amber-400/20 px-3.5 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-400/30 transition-all shadow-sm"
+              >
+                <RotateCcw className="size-3.5" /> Resume Scan
+              </button>
+            )}
+          </div>
         </div>
       )}
 
